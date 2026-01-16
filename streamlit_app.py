@@ -491,21 +491,31 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
     """
     Costruisce i TURNI a partire dalle corse (roundtrip).
 
+    Ogni corsa:
+      - parte da Piazza Cavour
+      - torna a Piazza Cavour
+      - è già un A/R completo.
+
     Strategia:
-    - ordina tutte le corse per orario di inizio;
-    - accumula corse in un turno finché il nastro ≤ 8h e numero corse ≤ 3;
-    - quando aggiungere una nuova corsa farebbe superare gli 8h o le 3 corse,
-      chiude il turno e ne apre uno nuovo.
+      - ordina tutte le corse per orario di inizio;
+      - accumula corse in un turno finché:
+          * il nastro <= 8h
+          * il numero di corse <= 3
+          * la nuova corsa NON si sovrappone alla precedente nel tempo
+      - se uno di questi vincoli salta, si chiude il turno corrente e se ne apre uno nuovo.
 
     Nastro:
-    - inizio turno = inizio prima corsa - 20' (10' pre + 10' deposito→PCV)
-    - fine turno   = fine ultima corsa + 12' (10' PCV→deposito + 2' post)
+      - inizio turno = inizio prima corsa - 20' (10' pre + 10' deposito→PCV)
+      - fine turno   = fine ultima corsa + 12' (10' PCV→deposito + 2' post)
 
-    Ogni turno inizia e finisce a Piazza Cavour perché ogni corsa è A/R completa.
+    Questo garantisce che:
+      - ogni turno inizia e finisce a Piazza Cavour,
+      - le corse nello stesso turno siano temporalmente compatibili (nessun accavallamento).
     """
     if not roundtrips:
         return []
 
+    # corse ordinate per inizio
     rts_sorted = sorted(roundtrips, key=lambda r: r["start"])
     shifts_rts: List[List[dict]] = []
     current: List[dict] = []
@@ -520,23 +530,38 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
         return (shift_end - shift_start).total_seconds() / 60.0
 
     for rt in rts_sorted:
+        # se non c'è un turno aperto, apri con questa corsa
         if not current:
             current = [rt]
             continue
 
+        last_rt = current[-1]
+
+        # vincolo 1: la nuova corsa deve partire DOPO la fine dell'ultima corsa del turno
+        # (altrimenti lo stesso bus dovrebbe essere in due posti contemporaneamente)
+        if rt["start"] < last_rt["end"]:
+            # non compatibile con il turno corrente → chiudi il turno e aprine uno nuovo
+            shifts_rts.append(current)
+            current = [rt]
+            continue
+
+        # vincolo 2: prova ad aggiungere la corsa e verifica nastro e numero corse
         tentative = current + [rt]
         nastro = nastro_minutes_for(tentative)
 
-        # priorità a turni "pieni" fino a 3 corse, nastro <= 8h
         if len(tentative) <= 3 and nastro <= 8 * 60:
+            # ok, stessa macchina può fare anche questa corsa
             current.append(rt)
         else:
+            # il turno diventerebbe troppo lungo o con troppe corse → chiudi e riparti
             shifts_rts.append(current)
             current = [rt]
 
+    # ultimo turno
     if current:
         shifts_rts.append(current)
 
+    # costruisci la struttura finale dei turni
     shifts: List[dict] = []
     for rt_list in shifts_rts:
         first = rt_list[0]
