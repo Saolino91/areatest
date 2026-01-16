@@ -67,6 +67,10 @@ DAY_PREFIX = {
     "Sun": "Su",
 }
 
+# soglia per raggruppare voli ravvicinati (minuti)
+DEPARTURE_GROUP_DELTA_MIN = 20
+ARRIVAL_GROUP_DELTA_MIN = 20  # l'esempio con 15' è coperto (15 < 20)
+
 
 # =========================
 # PARSING PDF
@@ -92,7 +96,6 @@ def parse_pdf_to_flights_df(file_obj: io.BytesIO) -> pd.DataFrame:
     records: List[dict] = []
 
     with pdfplumber.open(file_obj) as pdf:
-        # larghezza pagina e ampiezza colonne
         first_page = pdf.pages[0]
         page_width = first_page.width
         col_width = page_width / 7.0
@@ -105,14 +108,12 @@ def parse_pdf_to_flights_df(file_obj: io.BytesIO) -> pd.DataFrame:
                 idx = 6
             return idx
 
-        # stato corrente per ogni colonna: data e weekday
         current_date_by_col = {i: None for i in range(7)}
         current_weekday_by_col = {i: None for i in range(7)}
 
-        # scorri tutte le pagine
         for page in pdf.pages:
             tables = page.find_tables()
-            tables = sorted(tables, key=lambda t: t.bbox[1])  # dall'alto in basso
+            tables = sorted(tables, key=lambda t: t.bbox[1])
 
             for t in tables:
                 rows = t.extract()
@@ -127,7 +128,6 @@ def parse_pdf_to_flights_df(file_obj: io.BytesIO) -> pd.DataFrame:
                 first_cell = (first_row[0] or "").strip() if first_row else ""
                 m = DAY_PATTERN.match(first_cell)
 
-                # caso 1: tabella con intestazione del giorno (es. "Sun 22 Mar 2026")
                 if m:
                     weekday = m.group(1)
                     day_num = int(m.group(2))
@@ -143,9 +143,7 @@ def parse_pdf_to_flights_df(file_obj: io.BytesIO) -> pd.DataFrame:
                     cur_date = date(year, month_num, day_num)
                     current_date_by_col[col] = cur_date
                     current_weekday_by_col[col] = weekday
-                    start_idx = 2  # riga 1 = header "Flight RouteA/D Type ETA ETD"
-
-                # caso 2: continuazione del giorno corrente di quella colonna
+                    start_idx = 2
                 else:
                     cur_date = current_date_by_col[col]
                     cur_weekday = current_weekday_by_col[col]
@@ -162,7 +160,6 @@ def parse_pdf_to_flights_df(file_obj: io.BytesIO) -> pd.DataFrame:
                 if cur_date is None or cur_weekday is None:
                     continue
 
-                # estrai righe voli
                 for row in rows[start_idx:]:
                     if not row or not row[0]:
                         continue
@@ -196,14 +193,11 @@ def parse_pdf_to_flights_df(file_obj: io.BytesIO) -> pd.DataFrame:
         )
 
     df = pd.DataFrame(records)
-
-    # normalizzazione
     df["Type"] = df["Type"].str.upper().str.strip()
     df["AD"] = df["AD"].str.upper().str.strip()
     df["ETA"] = df["ETA"].str.strip()
     df["ETD"] = df["ETD"].str.strip()
 
-    # solo PAX (CARGO esclusi automaticamente)
     df = df[df["Type"] == "PAX"].copy()
     df.replace({"": None}, inplace=True)
 
@@ -215,11 +209,6 @@ def parse_pdf_to_flights_df(file_obj: io.BytesIO) -> pd.DataFrame:
 # =========================
 
 def compute_time_value(row: pd.Series) -> Optional[str]:
-    """
-    Valore da mettere nella matrice:
-    - ETA se AD = A (arrivo)
-    - ETD se AD in {P, D, DEP, DEPT} (partenza)
-    """
     ad = str(row.get("AD", "")).upper()
 
     if ad in ("A", "ARR", "ARRIVAL"):
@@ -232,14 +221,6 @@ def compute_time_value(row: pd.Series) -> Optional[str]:
 
 
 def build_matrix_for_weekday(flights: pd.DataFrame, weekday: str) -> pd.DataFrame:
-    """
-    Matrice per un dato weekday:
-
-    - Righe = 3 campi:
-        Flight, Route, A/D
-    - Colonne = date del periodo (dd-mm)
-    - Celle = ETA (se arrivo) o ETD (se partenza)
-    """
     if flights.empty:
         return pd.DataFrame()
 
@@ -249,7 +230,6 @@ def build_matrix_for_weekday(flights: pd.DataFrame, weekday: str) -> pd.DataFram
 
     subset["TimeValue"] = subset.apply(compute_time_value, axis=1)
     subset = subset.dropna(subset=["TimeValue"])
-
     if subset.empty:
         return pd.DataFrame()
 
@@ -280,24 +260,14 @@ def build_matrix_for_weekday(flights: pd.DataFrame, weekday: str) -> pd.DataFram
 # =========================
 
 def style_ad(val: str) -> str:
-    """
-    Colore per la colonna AD:
-    - P → rosso
-    - A → verde
-    """
     if val == "P":
-        return "color: #f97373;"  # rosso soft
+        return "color: #f97373;"
     if val == "A":
-        return "color: #4ade80;"  # verde soft
+        return "color: #4ade80;"
     return ""
 
 
 def style_time(row: pd.Series):
-    """
-    Colora gli orari (colonne data) in base al valore di AD nella riga:
-    - se AD = P → orari rossi
-    - se AD = A → orari verdi
-    """
     ad = row.get("AD", None)
     color = None
     if ad == "P":
@@ -323,7 +293,6 @@ def style_time(row: pd.Series):
 # =========================
 
 def combine_date_time(d: date, time_str: str) -> Optional[datetime]:
-    """Combina una data e una stringa HH:MM in un datetime; None se invalida/vuota."""
     if not time_str:
         return None
     try:
@@ -340,7 +309,6 @@ def filter_flights_for_turns(
     selected_airports: List[str],
     ad_choice: str,
 ) -> pd.DataFrame:
-    """Applica agli eventi originari gli stessi filtri della matrice."""
     subset = flights_df[flights_df["Weekday"] == weekday].copy()
 
     if flight_filter:
@@ -361,16 +329,17 @@ def filter_flights_for_turns(
 
 def build_bus_trips_from_flights(filtered_flights: pd.DataFrame) -> List[dict]:
     """
-    Costruisce le 'corse bus' a partire dai voli filtrati.
+    Costruisce le corse bus a partire dai voli filtrati.
 
-    - Per le PARTENZE (AD = P):
-        * si raggruppano voli nello stesso giorno con delta ETD <= 20' consecutivi
-        * il bus arriva in aeroporto 1h prima del volo più precoce del gruppo
-        * parte da Piazza Cavour 40' prima dell'arrivo in aeroporto.
-    - Per gli ARRIVI (AD = A):
-        * ogni volo genera una corsa separata
-        * partenza bus dall'aeroporto: ETA + 25'
-        * arrivo a Piazza Cavour: + 35'.
+    PARTENZE (AD = P):
+    - raggruppo voli nello stesso giorno con delta ETD consecutivo <= DEPARTURE_GROUP_DELTA_MIN
+    - il bus arriva in aeroporto 1h prima del volo più precoce del gruppo
+    - parte da Piazza Cavour 40' prima.
+
+    ARRIVI (AD = A):
+    - raggruppo voli nello stesso giorno con delta ETA consecutivo <= ARRIVAL_GROUP_DELTA_MIN
+    - il bus parte dall'aeroporto 25' dopo il volo che atterra per ultimo del gruppo
+    - arriva a Piazza Cavour 35' dopo la partenza.
     """
     trips: List[dict] = []
 
@@ -395,7 +364,7 @@ def build_bus_trips_from_flights(filtered_flights: pd.DataFrame) -> List[dict]:
                     prev = dep_rows.iloc[j - 1]["flight_dt"]
                     cur = dep_rows.iloc[j]["flight_dt"]
                     delta_min = (cur - prev).total_seconds() / 60.0
-                    if delta_min <= 20:
+                    if delta_min <= DEPARTURE_GROUP_DELTA_MIN:
                         group.append(dep_rows.iloc[j])
                         j += 1
                     else:
@@ -425,9 +394,22 @@ def build_bus_trips_from_flights(filtered_flights: pd.DataFrame) -> List[dict]:
             arr_rows = arr_rows.dropna(subset=["flight_dt"])
             arr_rows = arr_rows.sort_values("flight_dt")
 
-            for _, r in arr_rows.iterrows():
-                dt_arr = r["flight_dt"]
-                bus_dep_apt = dt_arr + timedelta(minutes=25)
+            i = 0
+            while i < len(arr_rows):
+                group = [arr_rows.iloc[i]]
+                j = i + 1
+                while j < len(arr_rows):
+                    prev = arr_rows.iloc[j - 1]["flight_dt"]
+                    cur = arr_rows.iloc[j]["flight_dt"]
+                    delta_min = (cur - prev).total_seconds() / 60.0
+                    if delta_min <= ARRIVAL_GROUP_DELTA_MIN:
+                        group.append(arr_rows.iloc[j])
+                        j += 1
+                    else:
+                        break
+
+                latest_dt = group[-1]["flight_dt"]
+                bus_dep_apt = latest_dt + timedelta(minutes=25)
                 bus_arr_pcv = bus_dep_apt + timedelta(minutes=35)
 
                 trips.append(
@@ -436,11 +418,12 @@ def build_bus_trips_from_flights(filtered_flights: pd.DataFrame) -> List[dict]:
                         "Direction": "APT-PCV",
                         "service_start": bus_dep_apt,
                         "service_end": bus_arr_pcv,
-                        "flights": [r["Flight"]],
+                        "flights": [g["Flight"] for g in group],
                         "ad_type": "A",
-                        "routes": [r["Route"]],
+                        "routes": [g["Route"] for g in group],
                     }
                 )
+                i = j
 
     trips = sorted(trips, key=lambda t: t["service_start"])
     return trips
@@ -450,17 +433,14 @@ def build_shifts_from_trips(trips: List[dict], weekday: str) -> List[dict]:
     """
     Costruisce turni guida a partire dalle corse bus.
 
-    Strategia (prima versione semplificata):
+    Strategia:
     - ordina tutte le corse per orario di inizio;
-    - accumula sequenze di massimo 3 corse, rispettando un nastro massimo di 8 ore;
-    - ogni sequenza = 1 turno;
-    - nastro = (fine ultima corsa + post/trasferimento) - (inizio prima corsa - pre/trasferimento)
-      con pre+trasferimento = 20', post+ritorno+post = 12'.
+    - accumula corse in un turno finché il nastro ≤ 8h (massimizzando il numero di corse);
+    - quando aggiungere una nuova corsa farebbe superare le 8h, chiude il turno e ne apre uno nuovo.
 
-    Classificazione:
-    - nastro <= 180'  → 'Supplemento'
-    - 180' < nastro < 360' → 'Part-time'
-    - nastro >= 360' → 'Intero'
+    Nastro:
+    - inizio turno = inizio prima corsa - 20' (10' pre + 10' trasferimento deposito→PCV)
+    - fine turno   = fine ultima corsa + 12' (10' trasferimento PCV→deposito + 2' post)
     """
     if not trips:
         return []
@@ -486,8 +466,7 @@ def build_shifts_from_trips(trips: List[dict], weekday: str) -> List[dict]:
         tentative = current + [trip]
         nastro = nastro_minutes_for(tentative)
 
-        # vincoli: max 3 corse, nastro <= 8h
-        if len(tentative) <= 3 and nastro <= 8 * 60:
+        if nastro <= 8 * 60:
             current.append(trip)
         else:
             shifts_trips.append(current)
@@ -517,14 +496,24 @@ def build_shifts_from_trips(trips: List[dict], weekday: str) -> List[dict]:
         else:
             tipo_turno = "Intero"
 
-        # dettaglio corse
-        trip_summaries = []
+        # dettagli corse nel formato richiesto
+        detail_lines = []
         for t in st_trips:
-            dir_label = "PCV→APT" if t["Direction"] == "PCV-APT" else "APT→PCV"
-            time_str = f"{t['service_start'].strftime('%H:%M')}-{t['service_end'].strftime('%H:%M')}"
-            fl_str = ",".join(t["flights"])
-            trip_summaries.append(f"{dir_label} {time_str} ({fl_str})")
-        detail = " | ".join(trip_summaries)
+            if t["Direction"] == "PCV-APT":
+                luogo_p = "Piazza Cavour"
+                luogo_a = "Aeroporto"
+            else:
+                luogo_p = "Aeroporto"
+                luogo_a = "Piazza Cavour"
+
+            ora_p = t["service_start"].strftime("%H:%M")
+            ora_a = t["service_end"].strftime("%H:%M")
+            codici = ",".join(t["flights"])
+
+            line = f"{ora_p}, {luogo_p}, {luogo_a}, {ora_a}, {codici}"
+            detail_lines.append(line)
+
+        detail = "\n".join(detail_lines)
 
         shifts.append(
             {
@@ -543,7 +532,20 @@ def build_shifts_from_trips(trips: List[dict], weekday: str) -> List[dict]:
 
 
 def assign_shift_codes(shifts: List[dict], weekday: str) -> List[dict]:
-    """Assegna i codici turno secondo la codifica richiesta."""
+    """
+    Assegna i codici turno.
+
+    - prefisso = prime due lettere del weekday (Mo, Tu, ...)
+    - numerazione:
+        01–49 turni che iniziano prima delle 12:00,
+        50–99 turni che iniziano dalle 12:00 in poi.
+    - suffisso:
+        si basa sul numero di "cicli A/R" = floor(trip_count / 2):
+          >=3 → 'I'
+           2   → 'P'
+           1   → 'S'
+           0   → 'S'
+    """
     if not shifts:
         return shifts
 
@@ -557,10 +559,10 @@ def assign_shift_codes(shifts: List[dict], weekday: str) -> List[dict]:
 
     for idx, s in enumerate(am_shifts, start=1):
         num = min(idx, 49)
-        trips = s["trip_count"]
-        if trips >= 3:
+        cycles = s["trip_count"] // 2
+        if cycles >= 3:
             suffix = "I"
-        elif trips == 2:
+        elif cycles == 2:
             suffix = "P"
         else:
             suffix = "S"
@@ -568,10 +570,10 @@ def assign_shift_codes(shifts: List[dict], weekday: str) -> List[dict]:
 
     for j, s in enumerate(pm_shifts, start=50):
         num = min(j, 99)
-        trips = s["trip_count"]
-        if trips >= 3:
+        cycles = s["trip_count"] // 2
+        if cycles >= 3:
             suffix = "I"
-        elif trips == 2:
+        elif cycles == 2:
             suffix = "P"
         else:
             suffix = "S"
@@ -583,7 +585,7 @@ def assign_shift_codes(shifts: List[dict], weekday: str) -> List[dict]:
 def generate_driver_shifts(filtered_flights: pd.DataFrame, weekday: str) -> pd.DataFrame:
     """
     Pipeline completa:
-    - da voli filtrati → corse bus → turni (lista dict) → DataFrame pronto per UI.
+    - da voli filtrati → corse bus (con raggruppamenti) → turni → DataFrame pronto per UI.
     """
     trips = build_bus_trips_from_flights(filtered_flights)
     if not trips:
@@ -603,11 +605,13 @@ def generate_driver_shifts(filtered_flights: pd.DataFrame, weekday: str) -> pd.D
         work_min = int(round(s["work_min"]))
         trip_count = s["trip_count"]
         code = s.get("code", "")
-        tipo_turno = "Intero"
+
         if nastro_min <= 180:
             tipo_turno = "Supplemento"
         elif nastro_min < 360:
             tipo_turno = "Part-time"
+        else:
+            tipo_turno = "Intero"
 
         rows.append(
             {
@@ -619,8 +623,10 @@ def generate_driver_shifts(filtered_flights: pd.DataFrame, weekday: str) -> pd.D
                 "Fine turno": end_dt.strftime("%H:%M"),
                 "Durata nastro (min)": nastro_min,
                 "Durata lavoro (min)": work_min,
-                "Corse servite": trip_count,
-                "Dettaglio corse": s["detail"],
+                "Numero corse": trip_count,
+                "Dettaglio corse (Ora Partenza, Luogo Partenza, Luogo Destinazione, Ora Arrivo, Codici voli serviti)": s[
+                    "detail"
+                ],
             }
         )
 
@@ -714,10 +720,8 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # Titolo
     st.title("✈️ Flight Matrix")
 
-    # Intro card
     with st.container():
         st.markdown(
             """
@@ -729,6 +733,7 @@ def main():
                     <li>esclude i voli <strong>CARGO</strong></li>
                     <li>raggruppa per <strong>giorno della settimana</strong></li>
                     <li>mostra una <strong>matrice</strong> con i voli per tipologia giorno</li>
+                    <li>genera <strong>turni guida</strong> sulla base dei voli filtrati</li>
                 </ul>
             </div>
             """,
@@ -743,7 +748,6 @@ def main():
         st.info("Carica il PDF per procedere.")
         return
 
-    # Parsing
     with st.spinner("Parsing del PDF in corso..."):
         flights_df = parse_pdf_to_flights_df(uploaded_file)
 
@@ -751,7 +755,6 @@ def main():
         st.error("Non sono stati trovati voli PAX o la struttura del PDF non è riconosciuta.")
         return
 
-    # Metriche globali
     unique_days = sorted(flights_df["Date"].unique())
     num_days = len(unique_days)
     num_flights = len(flights_df)
@@ -771,13 +774,11 @@ def main():
 
     st.success("Parsing completato.")
 
-    # Giorni effettivamente presenti
     weekdays_present = sorted(
         flights_df["Weekday"].unique(),
         key=lambda x: WEEKDAY_ORDER.index(x),
     )
 
-    # Sidebar
     st.sidebar.header("Filtro giorno")
     selected_weekday = st.sidebar.selectbox(
         "Seleziona giorno della settimana",
@@ -791,13 +792,11 @@ def main():
         st.warning("Per il giorno selezionato non sono stati trovati voli PAX con orari validi.")
         return
 
-    # Dati per la tipologia di giorno selezionata
     label_it = WEEKDAY_LABELS_IT.get(selected_weekday, selected_weekday)
     weekday_ops = flights_df[flights_df["Weekday"] == selected_weekday]
     weekday_flights_count = len(weekday_ops)
     weekday_dates_count = weekday_ops["Date"].nunique()
 
-    # Badge giorno
     st.markdown(
         f"""
         <div style="margin-top: 1.2rem; margin-bottom: 0.3rem;">
@@ -810,13 +809,11 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # Numero voli per tipologia di giorno
     st.markdown(
         f"**Voli PAX per questo tipo di giorno:** {weekday_flights_count} "
         f"(su {weekday_dates_count} {label_it.lower()} nel periodo caricato)"
     )
 
-    # Legend arrivi/partenze
     st.markdown(
         """
         <div style="margin-bottom: 0.6rem; margin-top: 0.2rem;">
@@ -855,7 +852,6 @@ def main():
             key="flt_ad",
         )
 
-    # Applica i filtri alla matrice
     matrix_filtered = matrix_df.copy()
 
     if flight_filter:
@@ -876,12 +872,10 @@ def main():
     if matrix_filtered.empty:
         st.warning("Nessun volo corrisponde ai filtri impostati.")
     else:
-        # Rinomina colonne per la visualizzazione
         display_df = matrix_filtered.rename(
             columns={"Flight": "Codice Volo", "Route": "Aeroporto"}
         )
 
-        # Stile AD + orari
         if "AD" in display_df.columns:
             styled_df = (
                 display_df
@@ -894,7 +888,6 @@ def main():
 
         st.dataframe(styled_df, use_container_width=True, height=650)
 
-        # Export CSV matrice
         csv_buffer = display_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="⬇️ Scarica matrice in CSV",
