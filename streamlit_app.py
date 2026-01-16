@@ -8,7 +8,7 @@ App Streamlit per:
 4. Visualizzare una matrice voli × date con interfaccia curata e filtri.
 5. Esportare la matrice in CSV.
 6. Visualizzare un grafico a linee Arrivi/Partenze per giorno.
-7. Generare turni guida (prima versione) sulla base dei voli filtrati.
+7. Generare turni guida sulla base dei voli filtrati.
 """
 
 import io
@@ -329,7 +329,7 @@ def filter_flights_for_turns(
 
 def build_bus_trips_from_flights(filtered_flights: pd.DataFrame) -> List[dict]:
     """
-    Costruisce le corse bus a partire dai voli filtrati.
+    Costruisce i "legs" bus a partire dai voli filtrati.
 
     PARTENZE (AD = P):
     - raggruppo voli nello stesso giorno con delta ETD consecutivo <= DEPARTURE_GROUP_DELTA_MIN
@@ -349,7 +349,7 @@ def build_bus_trips_from_flights(filtered_flights: pd.DataFrame) -> List[dict]:
     for d in sorted(filtered_flights["Date"].unique()):
         day_rows = filtered_flights[filtered_flights["Date"] == d]
 
-        # PARTENZE
+        # PARTENZE: PCV -> APT
         dep_rows = day_rows[day_rows["AD"] == "P"].copy()
         if not dep_rows.empty:
             dep_rows["flight_dt"] = dep_rows["ETD"].apply(lambda s: combine_date_time(d, s))
@@ -387,7 +387,7 @@ def build_bus_trips_from_flights(filtered_flights: pd.DataFrame) -> List[dict]:
                 )
                 i = j
 
-        # ARRIVI
+        # ARRIVI: APT -> PCV
         arr_rows = day_rows[day_rows["AD"] == "A"].copy()
         if not arr_rows.empty:
             arr_rows["flight_dt"] = arr_rows["ETA"].apply(lambda s: combine_date_time(d, s))
@@ -429,64 +429,126 @@ def build_bus_trips_from_flights(filtered_flights: pd.DataFrame) -> List[dict]:
     return trips
 
 
-def build_shifts_from_trips(trips: List[dict], weekday: str) -> List[dict]:
+def build_roundtrips_from_trips(trips: List[dict]) -> List[dict]:
     """
-    Costruisce turni guida a partire dalle corse bus.
+    Costruisce le CORSE (andata+ritorno) a partire dai legs PCV-APT / APT-PCV.
+
+    Ogni corsa:
+    - parte da Piazza Cavour
+    - arriva in aeroporto (leg PCV-APT)
+    - poi torna a Piazza Cavour (leg APT-PCV)
+    - la APT-PCV deve iniziare dopo la fine della PCV-APT.
+
+    Ogni corsa garantisce: inizio a PCV, fine a PCV.
+    """
+    roundtrips: List[dict] = []
+    if not trips:
+        return roundtrips
+
+    # raggruppo per data
+    for d in sorted({t["Date"] for t in trips}):
+        day_trips = [t for t in trips if t["Date"] == d]
+        dep_legs = [t for t in day_trips if t["Direction"] == "PCV-APT"]
+        arr_legs = [t for t in day_trips if t["Direction"] == "APT-PCV"]
+
+        dep_legs = sorted(dep_legs, key=lambda x: x["service_start"])
+        arr_legs = sorted(arr_legs, key=lambda x: x["service_start"])
+
+        used_arr = [False] * len(arr_legs)
+
+        for dep in dep_legs:
+            # cerco il primo arrivo compatibile dopo la fine del dep
+            chosen_idx = None
+            for idx, arr in enumerate(arr_legs):
+                if used_arr[idx]:
+                    continue
+                if arr["service_start"] >= dep["service_end"]:
+                    chosen_idx = idx
+                    break
+
+            if chosen_idx is None:
+                # dep non matchato, non genera corsa completa
+                continue
+
+            arr = arr_legs[chosen_idx]
+            used_arr[chosen_idx] = True
+
+            roundtrips.append(
+                {
+                    "Date": d,
+                    "start": dep["service_start"],
+                    "end": arr["service_end"],
+                    "dep_leg": dep,
+                    "arr_leg": arr,
+                }
+            )
+
+    roundtrips = sorted(roundtrips, key=lambda r: r["start"])
+    return roundtrips
+
+
+def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[dict]:
+    """
+    Costruisce i TURNI a partire dalle corse (roundtrip).
 
     Strategia:
     - ordina tutte le corse per orario di inizio;
-    - accumula corse in un turno finché il nastro ≤ 8h (massimizzando il numero di corse);
-    - quando aggiungere una nuova corsa farebbe superare le 8h, chiude il turno e ne apre uno nuovo.
+    - accumula corse in un turno finché il nastro ≤ 8h e numero corse ≤ 3;
+    - quando aggiungere una nuova corsa farebbe superare gli 8h o le 3 corse,
+      chiude il turno e ne apre uno nuovo.
 
     Nastro:
-    - inizio turno = inizio prima corsa - 20' (10' pre + 10' trasferimento deposito→PCV)
-    - fine turno   = fine ultima corsa + 12' (10' trasferimento PCV→deposito + 2' post)
+    - inizio turno = inizio prima corsa - 20' (10' pre + 10' deposito→PCV)
+    - fine turno   = fine ultima corsa + 12' (10' PCV→deposito + 2' post)
+
+    Ogni turno inizia e finisce a Piazza Cavour perché ogni corsa è A/R completa.
     """
-    if not trips:
+    if not roundtrips:
         return []
 
-    trips_sorted = sorted(trips, key=lambda t: t["service_start"])
-    shifts_trips: List[List[dict]] = []
+    rts_sorted = sorted(roundtrips, key=lambda r: r["start"])
+    shifts_rts: List[List[dict]] = []
     current: List[dict] = []
 
-    def nastro_minutes_for(trip_list: List[dict]) -> float:
-        if not trip_list:
+    def nastro_minutes_for(rt_list: List[dict]) -> float:
+        if not rt_list:
             return 0.0
-        first = trip_list[0]
-        last = trip_list[-1]
-        shift_start = first["service_start"] - timedelta(minutes=20)
-        shift_end = last["service_end"] + timedelta(minutes=12)
+        first = rt_list[0]
+        last = rt_list[-1]
+        shift_start = first["start"] - timedelta(minutes=20)
+        shift_end = last["end"] + timedelta(minutes=12)
         return (shift_end - shift_start).total_seconds() / 60.0
 
-    for trip in trips_sorted:
+    for rt in rts_sorted:
         if not current:
-            current = [trip]
+            current = [rt]
             continue
 
-        tentative = current + [trip]
+        tentative = current + [rt]
         nastro = nastro_minutes_for(tentative)
 
-        if nastro <= 8 * 60:
-            current.append(trip)
+        # priorità a turni "pieni" fino a 3 corse, nastro <= 8h
+        if len(tentative) <= 3 and nastro <= 8 * 60:
+            current.append(rt)
         else:
-            shifts_trips.append(current)
-            current = [trip]
+            shifts_rts.append(current)
+            current = [rt]
 
     if current:
-        shifts_trips.append(current)
+        shifts_rts.append(current)
 
     shifts: List[dict] = []
-    for st_trips in shifts_trips:
-        first = st_trips[0]
-        last = st_trips[-1]
-        shift_start = first["service_start"] - timedelta(minutes=20)
-        shift_end = last["service_end"] + timedelta(minutes=12)
+    for rt_list in shifts_rts:
+        first = rt_list[0]
+        last = rt_list[-1]
+        shift_start = first["start"] - timedelta(minutes=20)
+        shift_end = last["end"] + timedelta(minutes=12)
         nastro_min = (shift_end - shift_start).total_seconds() / 60.0
         work_min = sum(
-            (t["service_end"] - t["service_start"]).total_seconds() / 60.0
-            for t in st_trips
+            (rt["end"] - rt["start"]).total_seconds() / 60.0
+            for rt in rt_list
         )
-        trip_count = len(st_trips)
+        corses = len(rt_list)  # numero di corse A/R
 
         # classificazione semplice
         if nastro_min <= 180:
@@ -498,20 +560,23 @@ def build_shifts_from_trips(trips: List[dict], weekday: str) -> List[dict]:
 
         # dettagli corse nel formato richiesto
         detail_lines = []
-        for t in st_trips:
-            if t["Direction"] == "PCV-APT":
-                luogo_p = "Piazza Cavour"
-                luogo_a = "Aeroporto"
-            else:
-                luogo_p = "Aeroporto"
-                luogo_a = "Piazza Cavour"
+        for rt in rt_list:
+            dep = rt["dep_leg"]
+            arr = rt["arr_leg"]
 
-            ora_p = t["service_start"].strftime("%H:%M")
-            ora_a = t["service_end"].strftime("%H:%M")
-            codici = ",".join(t["flights"])
+            # leg andata: PCV -> APT
+            ora_p = dep["service_start"].strftime("%H:%M")
+            ora_a = dep["service_end"].strftime("%H:%M")
+            codici_dep = ",".join(dep["flights"])
+            line_dep = f"{ora_p}, Piazza Cavour, Aeroporto, {ora_a}, {codici_dep}"
+            detail_lines.append(line_dep)
 
-            line = f"{ora_p}, {luogo_p}, {luogo_a}, {ora_a}, {codici}"
-            detail_lines.append(line)
+            # leg ritorno: APT -> PCV
+            ora_p2 = arr["service_start"].strftime("%H:%M")
+            ora_a2 = arr["service_end"].strftime("%H:%M")
+            codici_arr = ",".join(arr["flights"])
+            line_arr = f"{ora_p2}, Aeroporto, Piazza Cavour, {ora_a2}, {codici_arr}"
+            detail_lines.append(line_arr)
 
         detail = "\n".join(detail_lines)
 
@@ -522,9 +587,9 @@ def build_shifts_from_trips(trips: List[dict], weekday: str) -> List[dict]:
                 "shift_end_dt": shift_end,
                 "nastro_min": nastro_min,
                 "work_min": work_min,
-                "trip_count": trip_count,
+                "corses": corses,
                 "detail": detail,
-                "dates_covered": sorted({t["Date"] for t in st_trips}),
+                "dates_covered": sorted({rt["Date"] for rt in rt_list}),
             }
         )
 
@@ -540,11 +605,10 @@ def assign_shift_codes(shifts: List[dict], weekday: str) -> List[dict]:
         01–49 turni che iniziano prima delle 12:00,
         50–99 turni che iniziano dalle 12:00 in poi.
     - suffisso:
-        si basa sul numero di "cicli A/R" = floor(trip_count / 2):
+        numero di corse (A/R) nel turno:
           >=3 → 'I'
-           2   → 'P'
-           1   → 'S'
-           0   → 'S'
+           2  → 'P'
+           1  → 'S'
     """
     if not shifts:
         return shifts
@@ -559,10 +623,10 @@ def assign_shift_codes(shifts: List[dict], weekday: str) -> List[dict]:
 
     for idx, s in enumerate(am_shifts, start=1):
         num = min(idx, 49)
-        cycles = s["trip_count"] // 2
-        if cycles >= 3:
+        corses = s["corses"]
+        if corses >= 3:
             suffix = "I"
-        elif cycles == 2:
+        elif corses == 2:
             suffix = "P"
         else:
             suffix = "S"
@@ -570,10 +634,10 @@ def assign_shift_codes(shifts: List[dict], weekday: str) -> List[dict]:
 
     for j, s in enumerate(pm_shifts, start=50):
         num = min(j, 99)
-        cycles = s["trip_count"] // 2
-        if cycles >= 3:
+        corses = s["corses"]
+        if corses >= 3:
             suffix = "I"
-        elif cycles == 2:
+        elif corses == 2:
             suffix = "P"
         else:
             suffix = "S"
@@ -585,13 +649,17 @@ def assign_shift_codes(shifts: List[dict], weekday: str) -> List[dict]:
 def generate_driver_shifts(filtered_flights: pd.DataFrame, weekday: str) -> pd.DataFrame:
     """
     Pipeline completa:
-    - da voli filtrati → corse bus (con raggruppamenti) → turni → DataFrame pronto per UI.
+    - da voli filtrati → legs bus → corse (A/R) → turni → DataFrame pronto per UI.
     """
     trips = build_bus_trips_from_flights(filtered_flights)
     if not trips:
         return pd.DataFrame()
 
-    shifts_list = build_shifts_from_trips(trips, weekday)
+    roundtrips = build_roundtrips_from_trips(trips)
+    if not roundtrips:
+        return pd.DataFrame()
+
+    shifts_list = build_shifts_from_roundtrips(roundtrips, weekday)
     if not shifts_list:
         return pd.DataFrame()
 
@@ -603,7 +671,7 @@ def generate_driver_shifts(filtered_flights: pd.DataFrame, weekday: str) -> pd.D
         end_dt = s["shift_end_dt"]
         nastro_min = int(round(s["nastro_min"]))
         work_min = int(round(s["work_min"]))
-        trip_count = s["trip_count"]
+        corses = s["corses"]
         code = s.get("code", "")
 
         if nastro_min <= 180:
@@ -623,10 +691,8 @@ def generate_driver_shifts(filtered_flights: pd.DataFrame, weekday: str) -> pd.D
                 "Fine turno": end_dt.strftime("%H:%M"),
                 "Durata nastro (min)": nastro_min,
                 "Durata lavoro (min)": work_min,
-                "Numero corse": trip_count,
-                "Dettaglio corse (Ora Partenza, Luogo Partenza, Luogo Destinazione, Ora Arrivo, Codici voli serviti)": s[
-                    "detail"
-                ],
+                "Numero corse": corses,  # una corsa = andata+ritorno
+                "Dettaglio corse": s["detail"],
             }
         )
 
@@ -915,14 +981,46 @@ def main():
                 if shifts_df.empty:
                     st.warning("Non è stato possibile generare turni compatibili con i vincoli.")
                 else:
-                    st.dataframe(shifts_df, use_container_width=True)
-                    csv_shifts = shifts_df.to_csv(index=False).encode("utf-8")
+                    # tabella turni: fermarsi a Numero corse
+                    display_cols = [
+                        "Codice turno",
+                        "Tipo giorno",
+                        "Tipo turno",
+                        "Data (esempio)",
+                        "Inizio turno",
+                        "Fine turno",
+                        "Durata nastro (min)",
+                        "Durata lavoro (min)",
+                        "Numero corse",
+                    ]
+                    df_turni_view = shifts_df[display_cols]
+
+                    st.dataframe(df_turni_view, use_container_width=True)
+
+                    csv_shifts = df_turni_view.to_csv(index=False).encode("utf-8")
                     st.download_button(
                         label="⬇️ Scarica turni guida in CSV",
                         data=csv_shifts,
                         file_name=f"turni_{label_it.lower()}.csv",
                         mime="text/csv",
                     )
+
+                    # Dettaglio di un turno selezionato (simile a "cliccare" sulla riga)
+                    st.markdown("#### Dettaglio corse per turno")
+                    selected_code = st.selectbox(
+                        "Seleziona un turno per visualizzare il dettaglio delle corse",
+                        options=shifts_df["Codice turno"],
+                    )
+
+                    if selected_code:
+                        detail_text = shifts_df.loc[
+                            shifts_df["Codice turno"] == selected_code, "Dettaglio corse"
+                        ].iloc[0]
+
+                        st.markdown(
+                            f"**Turno {selected_code} – elenco corse (una corsa = andata + ritorno):**"
+                        )
+                        st.text(detail_text)
 
     # --------- GRAFICO ARRIVI/PARTENZE PER GIORNO ---------
     st.markdown("### Andamento giornaliero Arrivi / Partenze")
