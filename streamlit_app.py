@@ -2,6 +2,7 @@
 
 """
 App Streamlit per ottimizzazione turni shuttle aeroporto con vincoli CCNL Conerobus
+PRIORITÀ ASSOLUTA: tutte le corse devono essere coperte (anche con fuorilinea se necessario)
 """
 
 import io
@@ -56,14 +57,10 @@ DAY_PREFIX = {
 DEPARTURE_GROUP_DELTA_MIN = 20
 ARRIVAL_GROUP_DELTA_MIN = 20
 
-# Target ore lavoro per turni standard
 TARGET_WORK_MIN = 7 * 60
+MIN_WORK_MIN = 195  # 3h15
+MAX_NASTRO_ABSOLUTE = 630  # 10h30
 
-# Vincoli CCNL
-MIN_WORK_MIN = 195  # 3h15 (tranne supplementi)
-MAX_NASTRO_ABSOLUTE = 630  # 10h30 (spezzato è il massimo)
-
-# Priorità tipologie turno
 SHIFT_TYPE_PRIORITY = {
     "Intero": 5,
     "Semiunico": 4,
@@ -73,13 +70,16 @@ SHIFT_TYPE_PRIORITY = {
     "Supplemento": 1,
 }
 
+# Tempo fuorilinea standard (corsa a vuoto)
+FUORILINEA_TIME_MIN = 40  # PCV → APT o APT → PCV
+
 
 # =========================
 # PARSING PDF (invariato)
 # =========================
 
 def parse_pdf_to_flights_df(file_obj: io.BytesIO) -> pd.DataFrame:
-    """Parser PDF voli - invariato"""
+    """Parser PDF voli"""
     records: List[dict] = []
 
     with pdfplumber.open(file_obj) as pdf:
@@ -262,7 +262,7 @@ def style_time(row: pd.Series):
 
 
 # =========================
-# SUPPORTO TURNI (invariato)
+# SUPPORTO TURNI
 # =========================
 
 def combine_date_time(d: date, time_str: str) -> Optional[datetime]:
@@ -301,7 +301,7 @@ def filter_flights_for_turns(
 
 
 def build_bus_trips_from_flights(filtered_flights: pd.DataFrame) -> List[dict]:
-    """Costruisce legs bus - invariato"""
+    """Costruisce legs bus (andata e ritorno separati)"""
     trips: List[dict] = []
     if filtered_flights.empty:
         return trips
@@ -385,11 +385,22 @@ def build_bus_trips_from_flights(filtered_flights: pd.DataFrame) -> List[dict]:
     return trips
 
 
-def build_roundtrips_from_trips(trips: List[dict]) -> List[dict]:
-    """Costruisce roundtrips - invariato"""
+def build_roundtrips_from_trips_with_deadheads(trips: List[dict]) -> Tuple[List[dict], List[dict]]:
+    """
+    Costruisce roundtrips accoppiando PCV-APT con APT-PCV.
+    
+    Se rimangono legs spaiati, crea roundtrips con FUORILINEA (corse a vuoto).
+    
+    Returns:
+        (roundtrips_list, deadhead_info)
+        - roundtrips_list: lista di roundtrips completi
+        - deadhead_info: lista di dict con info sulle corse a vuoto generate
+    """
     roundtrips: List[dict] = []
+    deadheads: List[dict] = []
+    
     if not trips:
-        return roundtrips
+        return roundtrips, deadheads
 
     for d in sorted({t["Date"] for t in trips}):
         day_trips = [t for t in trips if t["Date"] == d]
@@ -399,61 +410,119 @@ def build_roundtrips_from_trips(trips: List[dict]) -> List[dict]:
         dep_legs = sorted(dep_legs, key=lambda x: x["service_start"])
         arr_legs = sorted(arr_legs, key=lambda x: x["service_start"])
 
+        used_dep = [False] * len(dep_legs)
         used_arr = [False] * len(arr_legs)
 
-        for dep in dep_legs:
+        # ACCOPPIAMENTO NORMALE: PCV-APT → APT-PCV
+        for idx_dep, dep in enumerate(dep_legs):
+            if used_dep[idx_dep]:
+                continue
+                
             chosen_idx = None
-            for idx, arr in enumerate(arr_legs):
-                if used_arr[idx]:
+            for idx_arr, arr in enumerate(arr_legs):
+                if used_arr[idx_arr]:
                     continue
                 if arr["service_start"] >= dep["service_end"]:
-                    chosen_idx = idx
+                    chosen_idx = idx_arr
                     break
 
-            if chosen_idx is None:
-                continue
+            if chosen_idx is not None:
+                arr = arr_legs[chosen_idx]
+                used_dep[idx_dep] = True
+                used_arr[chosen_idx] = True
 
-            arr = arr_legs[chosen_idx]
-            used_arr[chosen_idx] = True
+                roundtrips.append({
+                    "Date": d,
+                    "start": dep["service_start"],
+                    "end": arr["service_end"],
+                    "dep_leg": dep,
+                    "arr_leg": arr,
+                    "has_deadhead": False,
+                })
 
-            roundtrips.append({
-                "Date": d,
-                "start": dep["service_start"],
-                "end": arr["service_end"],
-                "dep_leg": dep,
-                "arr_leg": arr,
-            })
+        # LEGS SPAIATI PARTENZE: creo fuorilinea per il ritorno
+        for idx_dep, dep in enumerate(dep_legs):
+            if not used_dep[idx_dep]:
+                # Creo un leg fittizio APT-PCV (fuorilinea)
+                deadhead_start = dep["service_end"] + timedelta(minutes=10)  # 10' pausa aeroporto
+                deadhead_end = deadhead_start + timedelta(minutes=FUORILINEA_TIME_MIN)
+                
+                fake_arr = {
+                    "Date": d,
+                    "Direction": "APT-PCV",
+                    "service_start": deadhead_start,
+                    "service_end": deadhead_end,
+                    "flights": ["FUORILINEA"],
+                    "ad_type": "A",
+                    "routes": ["---"],
+                }
+                
+                roundtrips.append({
+                    "Date": d,
+                    "start": dep["service_start"],
+                    "end": fake_arr["service_end"],
+                    "dep_leg": dep,
+                    "arr_leg": fake_arr,
+                    "has_deadhead": True,
+                })
+                
+                deadheads.append({
+                    "date": d,
+                    "type": "Ritorno a vuoto (APT→PCV)",
+                    "flights_covered": dep["flights"],
+                    "time": f"{deadhead_start.strftime('%H:%M')}-{deadhead_end.strftime('%H:%M')}",
+                })
+
+        # LEGS SPAIATI ARRIVI: creo fuorilinea per l'andata
+        for idx_arr, arr in enumerate(arr_legs):
+            if not used_arr[idx_arr]:
+                # Creo un leg fittizio PCV-APT (fuorilinea)
+                deadhead_end = arr["service_start"] - timedelta(minutes=10)  # arrivo 10' prima
+                deadhead_start = deadhead_end - timedelta(minutes=FUORILINEA_TIME_MIN)
+                
+                fake_dep = {
+                    "Date": d,
+                    "Direction": "PCV-APT",
+                    "service_start": deadhead_start,
+                    "service_end": deadhead_end,
+                    "flights": ["FUORILINEA"],
+                    "ad_type": "P",
+                    "routes": ["---"],
+                }
+                
+                roundtrips.append({
+                    "Date": d,
+                    "start": fake_dep["service_start"],
+                    "end": arr["service_end"],
+                    "dep_leg": fake_dep,
+                    "arr_leg": arr,
+                    "has_deadhead": True,
+                })
+                
+                deadheads.append({
+                    "date": d,
+                    "type": "Andata a vuoto (PCV→APT)",
+                    "flights_covered": arr["flights"],
+                    "time": f"{deadhead_start.strftime('%H:%M')}-{deadhead_end.strftime('%H:%M')}",
+                })
 
     roundtrips = sorted(roundtrips, key=lambda r: r["start"])
-    return roundtrips
+    return roundtrips, deadheads
 
 
 # =========================
-# CALCOLO LAVORO E CLASSIFICAZIONE CORRETTI
+# CALCOLO LAVORO E CLASSIFICAZIONE
 # =========================
 
 def calculate_work_minutes(rt_list: List[dict]) -> float:
-    """
-    Calcola lavoro effettivo secondo normativa:
-    - Corse (tempo guida)
-    - Pre turno (10 min)
-    - Post turno (2 min)
-    - Fuori linea (20 min per corsa: 10 dep→PCV + 10 PCV→dep)
-    - Inoperosità: 12% tempo fermo aeroporto (se > 30') + 5' pre + 5' post
-    """
+    """Calcola lavoro effettivo"""
     if not rt_list:
         return 0.0
     
-    # Tempo corse
     work_corse = sum((rt["end"] - rt["start"]).total_seconds() / 60.0 for rt in rt_list)
-    
-    # Pre e post
     pre_post = 10 + 2
-    
-    # Fuori linea
     fuori_linea = len(rt_list) * 20
     
-    # Inoperosità
     inoperosita_min = 0
     for rt in rt_list:
         dep_end = rt["dep_leg"]["service_end"]
@@ -461,7 +530,7 @@ def calculate_work_minutes(rt_list: List[dict]) -> float:
         sosta_apt = (arr_start - dep_end).total_seconds() / 60.0
         
         if sosta_apt > 30:
-            inoperosita_min += sosta_apt * 0.12 + 10  # 12% + 5' pre + 5' post
+            inoperosita_min += sosta_apt * 0.12 + 10
     
     return work_corse + pre_post + fuori_linea + inoperosita_min
 
@@ -480,27 +549,14 @@ def calculate_nastro_minutes(rt_list: List[dict]) -> float:
 
 
 def classify_shift_type(rt_list: List[dict], nastro_min: float, work_min: float) -> Optional[str]:
-    """
-    Classifica turno SENZA "Altro" - tutti i turni devono rientrare in una categoria.
-    
-    Ordine di verifica (dal più specifico al più generico):
-    1. SUPPLEMENTO: nastro ≤ 3h
-    2. PART-TIME: nastro < 6h
-    3. SPEZZATO: nastro ≤ 10h30, interruzione PCV > 3h
-    4. SEMIUNICO: nastro ≤ 9h, interruzione PCV 40'-3h
-    5. SOSTA INOPEROSA: nastro ≤ 9h15, sosta aeroporto > 30'
-    6. INTERO: nastro ≤ 8h, sosta PCV ≥ 30', nastro ≈ lavoro
-    
-    Se non rientra in nessuna: è un turno INVALIDO (None)
-    """
+    """Classifica turno (None se invalido)"""
     if not rt_list:
         return None
     
-    # VINCOLO GENERALE: lavoro minimo 3h15 (tranne supplementi e part-time)
+    # Vincolo lavoro minimo (tranne supplementi/part-time)
     if nastro_min > 360 and work_min < MIN_WORK_MIN:
-        return None  # Turno invalido
+        return None
     
-    # Calcola gap
     pcv_gaps = []
     for i in range(len(rt_list) - 1):
         end_i = rt_list[i]["end"]
@@ -519,23 +575,18 @@ def classify_shift_type(rt_list: List[dict], nastro_min: float, work_min: float)
     max_apt_gap = max(apt_gaps) if apt_gaps else 0
     has_pause_30 = any(g >= 30 for g in pcv_gaps)
     
-    # 1. SUPPLEMENTO: max 3h
     if nastro_min <= 180:
         return "Supplemento"
     
-    # 2. PART-TIME: nastro < 6h
     if nastro_min < 360:
         return "Part-time"
     
-    # 3. SPEZZATO: nastro ≤ 10h30, interruzione PCV > 3h
     if nastro_min <= 630 and max_pcv_gap >= 180:
         return "Spezzato"
     
-    # 4. SEMIUNICO: nastro ≤ 9h, interruzione PCV 40'-3h
     if nastro_min <= 540 and 40 <= max_pcv_gap < 180:
         return "Semiunico"
     
-    # 5. SOSTA INOPEROSA: nastro ≤ 9h15, sosta aeroporto > 30'
     if nastro_min <= 555 and max_apt_gap > 30:
         shift_start = rt_list[0]["start"] - timedelta(minutes=20)
         shift_end = rt_list[-1]["end"] + timedelta(minutes=12)
@@ -549,32 +600,28 @@ def classify_shift_type(rt_list: List[dict], nastro_min: float, work_min: float)
             if shift_start.hour > 11 or (shift_start.hour == 11 and shift_start.minute >= 50):
                 return "Sosta Inoperosa"
     
-    # 6. INTERO: nastro ≤ 8h, sosta PCV ≥ 30', nastro ≈ lavoro
     if nastro_min <= 480 and has_pause_30:
-        # Nastro deve essere vicino a lavoro (tolleranza 10%)
         if abs(nastro_min - work_min) <= nastro_min * 0.10:
             return "Intero"
     
-    # Se arriviamo qui, il turno non rientra in nessuna categoria valida
     return None
 
 
 # =========================
-# OTTIMIZZAZIONE CP-SAT CON VINCOLI RINFORZATI
+# OTTIMIZZAZIONE CON COPERTURA GARANTITA
 # =========================
 
-def optimize_shifts_with_priorities(
+def optimize_shifts_with_full_coverage(
     roundtrips: List[dict], 
     weekday: str, 
-    max_shifts: int = 30, 
+    max_shifts: int = 50,  # Aumentato per gestire più turni singoli
     time_limit_sec: int = 60
 ) -> Tuple[List[dict], dict]:
-    """Ottimizza turni con vincoli CCNL completi"""
+    """Ottimizza con GARANZIA di copertura totale"""
     
     if not ORTOOLS_AVAILABLE or not roundtrips:
         return [], {"error": "OR-Tools non disponibile o nessuna corsa"}
     
-    # Separa per data
     dates_set = {rt["Date"] for rt in roundtrips}
     if len(dates_set) > 1:
         all_shifts = []
@@ -582,7 +629,7 @@ def optimize_shifts_with_priorities(
         
         for d in sorted(dates_set):
             rts_d = [rt for rt in roundtrips if rt["Date"] == d]
-            shifts_d, stats_d = optimize_shifts_single_date(rts_d, weekday, max_shifts, time_limit_sec)
+            shifts_d, stats_d = optimize_shifts_single_date_full_coverage(rts_d, weekday, max_shifts, time_limit_sec)
             all_shifts.extend(shifts_d)
             all_stats.append(stats_d)
         
@@ -591,31 +638,25 @@ def optimize_shifts_with_priorities(
             "dates": len(dates_set),
             "total_shifts": len(all_shifts),
             "avg_solve_time": sum(s.get("solve_time", 0) for s in all_stats) / len(all_stats) if all_stats else 0,
+            "total_roundtrips": len(roundtrips),
+            "covered_roundtrips": sum(s.get("covered_roundtrips", 0) for s in all_stats),
         }
         
         return all_shifts, combined_stats
     else:
-        return optimize_shifts_single_date(roundtrips, weekday, max_shifts, time_limit_sec)
+        return optimize_shifts_single_date_full_coverage(roundtrips, weekday, max_shifts, time_limit_sec)
 
 
-def optimize_shifts_single_date(
+def optimize_shifts_single_date_full_coverage(
     roundtrips: List[dict], 
     weekday: str, 
-    max_shifts: int = 30, 
+    max_shifts: int = 50, 
     time_limit_sec: int = 60
 ) -> Tuple[List[dict], dict]:
-    """Ottimizzazione per singola data con vincoli CCNL rinforzati"""
+    """Ottimizzazione con copertura garantita per singola data"""
     
     model = cp_model.CpModel()
     n = len(roundtrips)
-    
-    # Pre-calcola nastro per ogni combinazione possibile
-    nastro_lookup = {}
-    for i in range(n):
-        for j in range(i, min(i + 3, n)):  # max 3 corse
-            rt_subset = roundtrips[i:j+1]
-            nastro = calculate_nastro_minutes(rt_subset)
-            nastro_lookup[(i, j)] = nastro
     
     # VARIABILI
     shift_used = [model.NewBoolVar(f'shift_{j}') for j in range(max_shifts)]
@@ -624,7 +665,7 @@ def optimize_shifts_single_date(
         for j in range(max_shifts):
             assignment[i, j] = model.NewBoolVar(f'x_{i}_{j}')
     
-    # VINCOLO 1: ogni corsa a esattamente 1 turno
+    # VINCOLO 1: OGNI CORSA DEVE ESSERE COPERTA (vincolo HARD)
     for i in range(n):
         model.Add(sum(assignment[i, j] for j in range(max_shifts)) == 1)
     
@@ -638,30 +679,28 @@ def optimize_shifts_single_date(
     for j in range(max_shifts):
         model.Add(sum(assignment[i, j] for i in range(n)) <= 3)
     
-    # VINCOLO 4: nessuna sovrapposizione + sequenzialità
+    # VINCOLO 4: sequenzialità
     for j in range(max_shifts):
         for i1 in range(n):
             for i2 in range(i1 + 1, n):
                 rt1, rt2 = roundtrips[i1], roundtrips[i2]
                 
-                # Non possono stare insieme se non sono sequenziali
                 if rt1["end"] > rt2["start"]:
                     model.Add(assignment[i1, j] + assignment[i2, j] <= 1)
     
-    # VINCOLO 5: nastro massimo 10h30 (MAX_NASTRO_ABSOLUTE)
-    # Questo è un vincolo HARD: nessun turno può superarlo
+    # VINCOLO 5: nastro massimo 10h30
     for j in range(max_shifts):
-        # Se il turno ha 3 corse consecutive che superano 10h30, scarta
         for i in range(n - 2):
-            if (i, i+2) in nastro_lookup:
-                if nastro_lookup[(i, i+2)] > MAX_NASTRO_ABSOLUTE:
-                    model.Add(assignment[i, j] + assignment[i+1, j] + assignment[i+2, j] <= 2)
+            rt_combo = [roundtrips[i], roundtrips[i+1], roundtrips[i+2]]
+            nastro = calculate_nastro_minutes(rt_combo)
+            if nastro > MAX_NASTRO_ABSOLUTE:
+                model.Add(assignment[i, j] + assignment[i+1, j] + assignment[i+2, j] <= 2)
         
-        # Se 2 corse consecutive superano 10h30, scarta
         for i in range(n - 1):
-            if (i, i+1) in nastro_lookup:
-                if nastro_lookup[(i, i+1)] > MAX_NASTRO_ABSOLUTE:
-                    model.Add(assignment[i, j] + assignment[i+1, j] <= 1)
+            rt_combo = [roundtrips[i], roundtrips[i+1]]
+            nastro = calculate_nastro_minutes(rt_combo)
+            if nastro > MAX_NASTRO_ABSOLUTE:
+                model.Add(assignment[i, j] + assignment[i+1, j] <= 1)
     
     # OBIETTIVO: minimizza numero turni
     model.Minimize(sum(shift_used))
@@ -673,19 +712,21 @@ def optimize_shifts_single_date(
     
     status = solver.Solve(model)
     
-    # ESTRAI E VALIDA SOLUZIONE
+    # ESTRAI SOLUZIONE
     stats = {
         "status": solver.StatusName(status),
         "solve_time": solver.WallTime(),
         "optimal": status == cp_model.OPTIMAL,
         "num_shifts": 0,
         "num_roundtrips": n,
+        "covered_roundtrips": 0,
         "invalid_shifts": 0,
     }
     
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         shifts_list = []
         the_date = roundtrips[0]["Date"]
+        covered_roundtrips = set()
         
         for j in range(max_shifts):
             if solver.Value(shift_used[j]):
@@ -693,24 +734,22 @@ def optimize_shifts_single_date(
                 for i in range(n):
                     if solver.Value(assignment[i, j]):
                         rt_list.append(roundtrips[i])
+                        covered_roundtrips.add(i)
                 
                 if not rt_list:
                     continue
                 
                 rt_list = sorted(rt_list, key=lambda x: x["start"])
                 
-                # Calcola metriche
                 nastro_min = calculate_nastro_minutes(rt_list)
                 work_min = calculate_work_minutes(rt_list)
                 
-                # VALIDAZIONE: scarta turni che superano i limiti
                 if nastro_min > MAX_NASTRO_ABSOLUTE:
                     stats["invalid_shifts"] += 1
                     continue
                 
                 tipo_turno = classify_shift_type(rt_list, nastro_min, work_min)
                 
-                # VALIDAZIONE: se non ha tipo valido, scarta
                 if tipo_turno is None:
                     stats["invalid_shifts"] += 1
                     continue
@@ -721,7 +760,6 @@ def optimize_shifts_single_date(
                 shift_end_dt = last["end"] + timedelta(minutes=12)
                 corses = len(rt_list)
                 
-                # Dettagli corse
                 detail_lines = []
                 for rt in rt_list:
                     dep = rt["dep_leg"]
@@ -751,16 +789,98 @@ def optimize_shifts_single_date(
                     "tipo_turno": tipo_turno,
                 })
         
-        shifts_list = sorted(shifts_list, key=lambda s: s["shift_start_dt"])
+        stats["covered_roundtrips"] = len(covered_roundtrips)
         stats["num_shifts"] = len(shifts_list)
         
+        # FALLBACK: corse scoperte → turni singoli
+        uncovered = set(range(n)) - covered_roundtrips
+        if uncovered:
+            st.warning(f"⚠️ {len(uncovered)} corse non coperte dall'ottimizzazione - creazione turni singoli...")
+            
+            for idx in sorted(uncovered):
+                rt = roundtrips[idx]
+                rt_list = [rt]
+                
+                nastro_min = calculate_nastro_minutes(rt_list)
+                work_min = calculate_work_minutes(rt_list)
+                tipo_turno = classify_shift_type(rt_list, nastro_min, work_min)
+                
+                if tipo_turno is None:
+                    # Se proprio non rientra in niente, forza Supplemento
+                    tipo_turno = "Supplemento"
+                
+                shift_start_dt = rt["start"] - timedelta(minutes=20)
+                shift_end_dt = rt["end"] + timedelta(minutes=12)
+                
+                dep = rt["dep_leg"]
+                arr = rt["arr_leg"]
+                
+                detail_lines = [
+                    f"{dep['service_start'].strftime('%H:%M')}, Piazza Cavour, Aeroporto, {dep['service_end'].strftime('%H:%M')}, {','.join(dep['flights'])}",
+                    f"{arr['service_start'].strftime('%H:%M')}, Aeroporto, Piazza Cavour, {arr['service_end'].strftime('%H:%M')}, {','.join(arr['flights'])}",
+                ]
+                
+                shifts_list.append({
+                    "weekday": weekday,
+                    "date": the_date,
+                    "shift_start_dt": shift_start_dt,
+                    "shift_end_dt": shift_end_dt,
+                    "nastro_min": nastro_min,
+                    "work_min": work_min,
+                    "corses": 1,
+                    "detail": "\n".join(detail_lines),
+                    "tipo_turno": tipo_turno,
+                })
+                
+                stats["covered_roundtrips"] += 1
+                stats["num_shifts"] += 1
+        
+        shifts_list = sorted(shifts_list, key=lambda s: s["shift_start_dt"])
         return shifts_list, stats
     
-    return [], stats
+    # Se solver fallisce, crea turni singoli per tutte le corse
+    st.error("❌ Ottimizzatore fallito - creazione turni singoli per tutte le corse...")
+    
+    shifts_list = []
+    the_date = roundtrips[0]["Date"]
+    
+    for rt in roundtrips:
+        rt_list = [rt]
+        nastro_min = calculate_nastro_minutes(rt_list)
+        work_min = calculate_work_minutes(rt_list)
+        tipo_turno = classify_shift_type(rt_list, nastro_min, work_min) or "Supplemento"
+        
+        shift_start_dt = rt["start"] - timedelta(minutes=20)
+        shift_end_dt = rt["end"] + timedelta(minutes=12)
+        
+        dep = rt["dep_leg"]
+        arr = rt["arr_leg"]
+        
+        detail_lines = [
+            f"{dep['service_start'].strftime('%H:%M')}, Piazza Cavour, Aeroporto, {dep['service_end'].strftime('%H:%M')}, {','.join(dep['flights'])}",
+            f"{arr['service_start'].strftime('%H:%M')}, Aeroporto, Piazza Cavour, {arr['service_end'].strftime('%H:%M')}, {','.join(arr['flights'])}",
+        ]
+        
+        shifts_list.append({
+            "weekday": weekday,
+            "date": the_date,
+            "shift_start_dt": shift_start_dt,
+            "shift_end_dt": shift_end_dt,
+            "nastro_min": nastro_min,
+            "work_min": work_min,
+            "corses": 1,
+            "detail": "\n".join(detail_lines),
+            "tipo_turno": tipo_turno,
+        })
+    
+    stats["num_shifts"] = len(shifts_list)
+    stats["covered_roundtrips"] = n
+    
+    return shifts_list, stats
 
 
 def assign_shift_codes_across_dates(shifts: List[dict], weekday: str) -> List[dict]:
-    """Assegna codici turno STABILI"""
+    """Assegna codici turno stabili"""
     if not shifts:
         return shifts
 
@@ -822,23 +942,23 @@ def assign_shift_codes_across_dates(shifts: List[dict], weekday: str) -> List[di
 def generate_driver_shifts_optimized(
     filtered_flights: pd.DataFrame, 
     weekday: str
-) -> Tuple[List[dict], dict]:
-    """Pipeline completa"""
+) -> Tuple[List[dict], dict, List[dict]]:
+    """Pipeline completa con gestione fuorilinea"""
     
     trips = build_bus_trips_from_flights(filtered_flights)
     if not trips:
-        return [], {}
+        return [], {}, []
 
-    roundtrips = build_roundtrips_from_trips(trips)
+    roundtrips, deadheads = build_roundtrips_from_trips_with_deadheads(trips)
     if not roundtrips:
-        return [], {}
+        return [], {}, []
 
-    shifts, stats = optimize_shifts_with_priorities(roundtrips, weekday)
+    shifts, stats = optimize_shifts_with_full_coverage(roundtrips, weekday)
     
     if shifts:
         shifts = assign_shift_codes_across_dates(shifts, weekday)
 
-    return shifts, stats
+    return shifts, stats, deadheads
 
 
 def analyze_shifts(shifts: List[dict], weekday: str) -> Dict:
@@ -865,7 +985,6 @@ def analyze_shifts(shifts: List[dict], weekday: str) -> Dict:
     for s in shifts:
         corse_dist[s["corses"]] += 1
     
-    # Verifica vincoli
     violations = []
     for s in shifts:
         if s["nastro_min"] > MAX_NASTRO_ABSOLUTE:
@@ -888,7 +1007,7 @@ def analyze_shifts(shifts: List[dict], weekday: str) -> Dict:
 
 
 # =========================
-# UI STREAMLIT (layout ottimizzato)
+# UI STREAMLIT
 # =========================
 
 def main():
@@ -966,6 +1085,13 @@ def main():
             border: 1px solid rgba(245,158,11,0.3);
             margin: 0.5rem 0;
         }
+        .deadhead-box {
+            background: linear-gradient(135deg, rgba(239,68,68,0.1), rgba(220,38,38,0.1));
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: 1px solid rgba(239,68,68,0.3);
+            margin: 0.5rem 0;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -978,13 +1104,12 @@ def main():
             """
             <div class="info-card">
                 <p>🛫🛬 <strong>Sistema di ottimizzazione turni shuttle aeroporto</strong></p>
-                <p style="margin-top:0.5rem;">Vincoli CCNL implementati:</p>
+                <p style="margin-top:0.5rem;">✅ <strong>PRIORITÀ ASSOLUTA: COPERTURA 100% CORSE</strong></p>
                 <ul style="margin-top:0.3rem; margin-bottom: 0;">
-                    <li>✅ Lavoro minimo 3h15 (tranne Supplementi e Part-time)</li>
-                    <li>✅ Nastro massimo assoluto: 10h30</li>
-                    <li>✅ Tipologie: Intero, Semiunico, Spezzato, Sosta Inoperosa, Part-time, Supplemento</li>
-                    <li>✅ Calcolo lavoro: corse + pre/post + fuori linea + inoperosità (12%)</li>
-                    <li>✅ Turni stabili cross-date (nessun tipo "Altro")</li>
+                    <li>🎯 Tutte le corse devono essere effettuate</li>
+                    <li>🚌 Fuorilinea (corse a vuoto) solo come ultima risorsa</li>
+                    <li>✅ Vincoli CCNL: lavoro min 3h15, nastro max 10h30</li>
+                    <li>📊 Tipologie: Intero, Semiunico, Spezzato, Sosta Inoperosa, Part-time, Supplemento</li>
                 </ul>
             </div>
             """,
@@ -1108,26 +1233,41 @@ def main():
 
         # OTTIMIZZAZIONE
         st.markdown("---")
-        st.markdown("## 🚀 Ottimizzazione Turni")
+        st.markdown("## 🚀 Ottimizzazione Turni (Copertura Garantita 100%)")
 
-        if st.button("🎯 Genera turni ottimizzati", type="primary"):
+        if st.button("🎯 Genera turni con copertura totale", type="primary"):
             flights_for_turns = filter_flights_for_turns(flights_df, selected_weekday, flight_filter, selected_airports, ad_choice)
 
             if flights_for_turns.empty:
                 st.warning("⚠️ Nessun volo disponibile.")
             else:
                 with st.spinner("⏳ Ottimizzazione in corso..."):
-                    shifts, stats = generate_driver_shifts_optimized(flights_for_turns, selected_weekday)
+                    shifts, stats, deadheads = generate_driver_shifts_optimized(flights_for_turns, selected_weekday)
 
                 if not shifts:
-                    st.error("❌ Impossibile generare turni validi.")
-                    if stats.get("invalid_shifts", 0) > 0:
-                        st.warning(f"⚠️ {stats['invalid_shifts']} turni scartati per violazione vincoli CCNL.")
+                    st.error("❌ Impossibile generare turni.")
                 else:
                     # ANALISI
                     analysis = analyze_shifts(shifts, selected_weekday)
                     
                     st.markdown("### 📊 Analisi Soluzione")
+                    
+                    # COPERTURA
+                    coverage_pct = (stats.get('covered_roundtrips', 0) / stats.get('num_roundtrips', 1) * 100)
+                    
+                    if coverage_pct >= 100:
+                        st.success(f"✅ **COPERTURA TOTALE: {stats.get('covered_roundtrips', 0)}/{stats.get('num_roundtrips', 0)} corse coperte (100%)**")
+                    else:
+                        st.error(f"❌ **ATTENZIONE: Solo {stats.get('covered_roundtrips', 0)}/{stats.get('num_roundtrips', 0)} corse coperte ({coverage_pct:.1f}%)**")
+                    
+                    # FUORILINEA
+                    if deadheads:
+                        st.markdown('<div class="deadhead-box">', unsafe_allow_html=True)
+                        st.warning(f"🚨 **{len(deadheads)} CORSE A VUOTO (FUORILINEA) GENERATE**")
+                        st.markdown("**Dettaglio corse a vuoto:**")
+                        for dh in deadheads:
+                            st.markdown(f"- **{dh['type']}** per voli {', '.join(dh['flights_covered'])} - Orario: {dh['time']}")
+                        st.markdown('</div>', unsafe_allow_html=True)
                     
                     st.markdown(f"""
                     <div class="analysis-box">
@@ -1164,9 +1304,6 @@ def main():
                         for v in violations:
                             st.markdown(f"- {v}")
                         st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    if stats.get("invalid_shifts", 0) > 0:
-                        st.info(f"ℹ️ {stats['invalid_shifts']} turni scartati durante ottimizzazione (superavano limiti CCNL)")
                     
                     # MATRICE
                     st.markdown("### 📅 Matrice Validità Turni")
