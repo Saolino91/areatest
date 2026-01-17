@@ -13,6 +13,7 @@ App Streamlit per:
 
 import io
 import re
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import List, Optional
 
@@ -57,14 +58,15 @@ MONTH_MAP = {
     "Dec": 12,
 }
 
+# Prefisso italiano per giorno (prime 2 lettere, maiuscole)
 DAY_PREFIX = {
-    "Mon": "Mo",
-    "Tue": "Tu",
-    "Wed": "We",
-    "Thu": "Th",
-    "Fri": "Fr",
-    "Sat": "Sa",
-    "Sun": "Su",
+    "Mon": "LU",
+    "Tue": "MA",
+    "Wed": "ME",
+    "Thu": "GI",
+    "Fri": "VE",
+    "Sat": "SA",
+    "Sun": "DO",
 }
 
 # soglia per raggruppare voli ravvicinati (minuti)
@@ -497,7 +499,7 @@ def classify_shift_type(roundtrips: List[dict], nastro_min: float, work_min: flo
     - Semiunico
     - Spezzato
     - Inoperoso
-    in modo approssimato ma coerente con le regole che hai descritto.
+    in modo approssimato ma coerente con le regole discusse.
     """
 
     # Supplemento: turno breve max 3h
@@ -508,7 +510,7 @@ def classify_shift_type(roundtrips: List[dict], nastro_min: float, work_min: flo
     if 180 < work_min < 360 and nastro_min <= 8 * 60:
         return "Part-time"
 
-    # calcolo gap a PCV tra le corse (end_i → start_{i+1})
+    # gap a PCV tra le corse (end_i → start_{i+1})
     pcv_gaps = []
     for i in range(len(roundtrips) - 1):
         end_i = roundtrips[i]["end"]
@@ -519,7 +521,7 @@ def classify_shift_type(roundtrips: List[dict], nastro_min: float, work_min: flo
     # gap all'aeroporto: dentro ogni roundtrip (fine PCV-APT → inizio APT-PCV)
     apt_gaps = []
     for rt in roundtrips:
-        dep_end = rt["dep_leg"]["service_end"]   # arrivo in aeroporto
+        dep_end = rt["dep_leg"]["service_end"]     # arrivo in aeroporto
         arr_start = rt["arr_leg"]["service_start"]  # partenza dall'aeroporto
         gap = (arr_start - dep_end).total_seconds() / 60.0
         apt_gaps.append(gap)
@@ -543,7 +545,6 @@ def classify_shift_type(roundtrips: List[dict], nastro_min: float, work_min: flo
     if nastro_min <= 8 * 60:
         if max_pcv_gap <= 40 and any(g >= 30 for g in pcv_gaps):
             return "Intero"
-        # altrimenti comunque Intero "sporco"
         return "Intero"
 
     # fallback
@@ -552,7 +553,7 @@ def classify_shift_type(roundtrips: List[dict], nastro_min: float, work_min: flo
 
 def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[dict]:
     """
-    Costruisce i TURNI a partire dalle corse (roundtrip).
+    Costruisce i TURNI a partire dalle corse (roundtrip) per UNA singola data.
 
     Ogni corsa:
       - parte da Piazza Cavour
@@ -572,14 +573,15 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
     Nastro:
       - inizio turno = inizio prima corsa - 20' (10' pre + 10' deposito→PCV)
       - fine turno   = fine ultima corsa + 12' (10' PCV→deposito + 2' post)
-
-    Questo garantisce che:
-      - ogni turno inizia e finisce a Piazza Cavour,
-      - le corse nello stesso turno siano temporalmente compatibili (nessun accavallamento),
-      - si tende a riempire i turni fino a ~7 ore di lavoro effettivo.
     """
     if not roundtrips:
         return []
+
+    # ATTENZIONE: roundtrips qui deve riferirsi a UNA sola data
+    dates_set = {rt["Date"] for rt in roundtrips}
+    if len(dates_set) > 1:
+        # se per errore arrivano date miste, separale fuori prima
+        raise ValueError("build_shifts_from_roundtrips deve ricevere corse di una sola data")
 
     rts_sorted = sorted(roundtrips, key=lambda r: r["start"])
     shifts_rts: List[List[dict]] = []
@@ -619,7 +621,6 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
 
         # vincolo nastro e max 3 corse
         if nastro_tent > 8 * 60 or len(tentative) > 3:
-            # turno corrente si chiude, anche se non ha raggiunto target
             shifts_rts.append(current)
             current = [rt]
             continue
@@ -627,21 +628,19 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
         # se aggiungere questa corsa ci avvicina o ci porta vicino al target di 7h,
         # la aggiungiamo; se andremmo molto oltre, chiudiamo prima
         if work_cur < TARGET_WORK_MIN:
-            # se ci porta fino a 7h o poco oltre (es. <= 8h di lavoro), ok
             if work_tent <= TARGET_WORK_MIN + 60:  # tolleranza +1h
                 current.append(rt)
             else:
-                # sarebbe troppo pieno → chiudo il turno attuale e apro uno nuovo
                 shifts_rts.append(current)
                 current = [rt]
         else:
-            # abbiamo già raggiunto almeno 7h, non aggiungiamo altro a questo turno
             shifts_rts.append(current)
             current = [rt]
 
     if current:
         shifts_rts.append(current)
 
+    the_date = next(iter(dates_set))
     shifts: List[dict] = []
     for rt_list in shifts_rts:
         first = rt_list[0]
@@ -682,13 +681,13 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
         shifts.append(
             {
                 "weekday": weekday,
+                "date": the_date,
                 "shift_start_dt": shift_start,
                 "shift_end_dt": shift_end,
                 "nastro_min": nastro_min,
                 "work_min": work_min,
                 "corses": corses,
                 "detail": detail,
-                "dates_covered": sorted({rt["Date"] for rt in rt_list}),
                 "tipo_turno": tipo_turno,
             }
         )
@@ -696,74 +695,121 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
     return shifts
 
 
-def assign_shift_codes(shifts: List[dict], weekday: str) -> List[dict]:
+def assign_shift_codes_across_dates(shifts: List[dict], weekday: str) -> List[dict]:
     """
-    Assegna i codici turno.
+    Assegna i codici turno tenendo conto di TUTTE le date del weekday.
 
-    - prefisso = prime due lettere del weekday (Mo, Tu, ...)
-    - numerazione:
-        01–49 turni che iniziano prima delle 12:00,
-        50–99 turni che iniziano dalle 12:00 in poi.
-    - suffisso:
-        numero di corse (A/R) nel turno:
-          >=3 → 'I'
-           2  → 'P'
-           1  → 'S'
+    - raggruppa i turni per "pattern" (tipo_turno, orario inizio/fine, numero corse)
+    - a ogni pattern assegna un codice unico:
+        prefisso = prime due lettere del giorno in italiano (LU, MA, ME, GI, VE, SA, DO)
+        numero  = 01–49 per turni che iniziano prima delle 12:00
+                  50–99 per turni che iniziano dalle 12:00
+        suffisso = I (>=3 corse), P (2 corse), S (1 corsa)
+    - tutti i turni con lo stesso pattern (anche se in date diverse)
+      ricevono lo stesso codice → turni "stabili" per tipo giorno.
     """
     if not shifts:
         return shifts
 
-    prefix = DAY_PREFIX.get(weekday, weekday[:2])
+    prefix = DAY_PREFIX.get(weekday, weekday[:2].upper())
 
-    am_shifts = [s for s in shifts if s["shift_start_dt"].hour < 12]
-    pm_shifts = [s for s in shifts if s["shift_start_dt"].hour >= 12]
+    # cluster per pattern
+    patterns = defaultdict(list)
+    for s in shifts:
+        key = (
+            s["tipo_turno"],
+            s["shift_start_dt"].time(),
+            s["shift_end_dt"].time(),
+            s["corses"],
+        )
+        patterns[key].append(s)
 
-    am_shifts = sorted(am_shifts, key=lambda s: s["shift_start_dt"])
-    pm_shifts = sorted(pm_shifts, key=lambda s: s["shift_start_dt"])
+    # lista (key, sample_shift) per ordinamento
+    pattern_items = []
+    for key, plist in patterns.items():
+        sample = sorted(plist, key=lambda x: x["shift_start_dt"])[0]
+        pattern_items.append((key, sample))
 
-    for idx, s in enumerate(am_shifts, start=1):
+    # separa AM/PM
+    am = [(key, s) for key, s in pattern_items if s["shift_start_dt"].hour < 12]
+    pm = [(key, s) for key, s in pattern_items if s["shift_start_dt"].hour >= 12]
+
+    am.sort(key=lambda ks: ks[1]["shift_start_dt"])
+    pm.sort(key=lambda ks: ks[1]["shift_start_dt"])
+
+    code_by_key = {}
+
+    # AM: 01–49
+    idx = 1
+    for key, sample in am:
         num = min(idx, 49)
-        corses = s["corses"]
+        idx += 1
+        corses = sample["corses"]
         if corses >= 3:
             suffix = "I"
         elif corses == 2:
             suffix = "P"
         else:
             suffix = "S"
-        s["code"] = f"{prefix}{num:02d}{suffix}"
+        code_by_key[key] = f"{prefix}{num:02d}{suffix}"
 
-    for j, s in enumerate(pm_shifts, start=50):
-        num = min(j, 99)
-        corses = s["corses"]
+    # PM: 50–99
+    idx = 50
+    for key, sample in pm:
+        num = min(idx, 99)
+        idx += 1
+        corses = sample["corses"]
         if corses >= 3:
             suffix = "I"
         elif corses == 2:
             suffix = "P"
         else:
             suffix = "S"
-        s["code"] = f"{prefix}{num:02d}{suffix}"
+        code_by_key[key] = f"{prefix}{num:02d}{suffix}"
 
-    return am_shifts + pm_shifts
+    # assegna codice a tutti i turni
+    for s in shifts:
+        key = (
+            s["tipo_turno"],
+            s["shift_start_dt"].time(),
+            s["shift_end_dt"].time(),
+            s["corses"],
+        )
+        s["code"] = code_by_key[key]
+
+    return shifts
 
 
 def generate_driver_shifts(filtered_flights: pd.DataFrame, weekday: str) -> pd.DataFrame:
     """
     Pipeline completa:
-    - da voli filtrati → legs bus → corse (A/R) → turni → DataFrame pronto per UI.
+    - da voli filtrati → legs bus → corse (A/R) → turni PER DATA
+    - poi clusterizza i turni per pattern e assegna codici uguali
+      per lo stesso schema di turno su date diverse.
     """
     trips = build_bus_trips_from_flights(filtered_flights)
     if not trips:
         return pd.DataFrame()
 
-    roundtrips = build_roundtrips_from_trips(trips)
-    if not roundtrips:
+    roundtrips_all = build_roundtrips_from_trips(trips)
+    if not roundtrips_all:
         return pd.DataFrame()
 
-    shifts_list = build_shifts_from_roundtrips(roundtrips, weekday)
+    shifts_list: List[dict] = []
+
+    # costruisci turni per ogni singola data del tipo giorno
+    for d in sorted(filtered_flights["Date"].unique()):
+        rts_d = [rt for rt in roundtrips_all if rt["Date"] == d]
+        if not rts_d:
+            continue
+        shifts_d = build_shifts_from_roundtrips(rts_d, weekday)
+        shifts_list.extend(shifts_d)
+
     if not shifts_list:
         return pd.DataFrame()
 
-    shifts_list = assign_shift_codes(shifts_list, weekday)
+    # assegna codici coerenti tra date
+    shifts_list = assign_shift_codes_across_dates(shifts_list, weekday)
 
     rows = []
     for s in shifts_list:
@@ -774,13 +820,15 @@ def generate_driver_shifts(filtered_flights: pd.DataFrame, weekday: str) -> pd.D
         corses = s["corses"]
         code = s.get("code", "")
         tipo_turno = s["tipo_turno"]
+        d = s["date"]
 
         rows.append(
             {
                 "Codice turno": code,
                 "Tipo giorno": WEEKDAY_LABELS_IT.get(weekday, weekday),
                 "Tipo turno": tipo_turno,
-                "Data (esempio)": s["dates_covered"][0].strftime("%d/%m/%Y"),
+                "Date": d,
+                "Data (esempio)": d.strftime("%d/%m/%Y"),
                 "Inizio turno": start_dt.strftime("%H:%M"),
                 "Fine turno": end_dt.strftime("%H:%M"),
                 "Durata nastro (min)": nastro_min,
@@ -791,7 +839,7 @@ def generate_driver_shifts(filtered_flights: pd.DataFrame, weekday: str) -> pd.D
         )
 
     df_shifts = pd.DataFrame(rows)
-    df_shifts = df_shifts.sort_values(["Inizio turno", "Codice turno"]).reset_index(drop=True)
+    df_shifts = df_shifts.sort_values(["Date", "Inizio turno", "Codice turno"]).reset_index(drop=True)
     return df_shifts
 
 
@@ -1099,11 +1147,53 @@ def main():
                         mime="text/csv",
                     )
 
+                    # --------- MATRICE VALIDITÀ TURNI × DATE ---------
+                    st.markdown("#### Matrice di validità dei turni per data")
+
+                    dates_for_matrix = sorted(flights_for_turns["Date"].unique())
+                    if dates_for_matrix:
+                        base = shifts_df[
+                            [
+                                "Codice turno",
+                                "Tipo turno",
+                                "Inizio turno",
+                                "Fine turno",
+                                "Durata lavoro (min)",
+                                "Date",
+                            ]
+                        ]
+
+                        rows_matrix = []
+                        for code in sorted(base["Codice turno"].unique()):
+                            sub = base[base["Codice turno"] == code]
+                            tipo = sub["Tipo turno"].iloc[0]
+                            start = sub["Inizio turno"].iloc[0]
+                            end = sub["Fine turno"].iloc[0]
+                            work = sub["Durata lavoro (min)"].iloc[0]
+
+                            row = {
+                                "Codice turno": code,
+                                "Tipo turno": tipo,
+                                "Inizio": start,
+                                "Fine": end,
+                                "Lavoro (min)": work,
+                            }
+
+                            for d in dates_for_matrix:
+                                col_name = d.strftime("%d-%m")
+                                has = any(sub["Date"] == d)
+                                row[col_name] = "✅" if has else ""
+
+                            rows_matrix.append(row)
+
+                        df_matrix = pd.DataFrame(rows_matrix)
+                        st.dataframe(df_matrix, use_container_width=True)
+
                     # Dettaglio di un turno selezionato
                     st.markdown("#### Dettaglio corse per turno")
                     selected_code = st.selectbox(
                         "Seleziona un turno per visualizzare il dettaglio delle corse",
-                        options=shifts_df["Codice turno"],
+                        options=shifts_df["Codice turno"].unique(),
                     )
 
                     if selected_code:
