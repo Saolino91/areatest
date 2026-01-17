@@ -1,14 +1,14 @@
 # streamlit_app.py
 
 """
-App Streamlit per ottimizzazione turni shuttle aeroporto con vincoli CCNL Conerobus
-PRIORITÀ ASSOLUTA: tutte le corse devono essere coperte
-
-NORMATIVA IMPLEMENTATA:
-- Lavoro = Corsa + Pre/Post turno (20+12) + Inoperosità (12% tempo fermo APT con 5+5 pre/post sosta)
-- Tipi turno: Intero (8h), Semiunico (9h), Spezzato (10:30), Sosta Inoperosa (9:15), Supplemento (3h)
-- Priorità: Interi > Semiunici/Spezzati > Sosta Inoperosa > Supplementi
-- Target: turni ~7 ore
+App Streamlit per:
+1. Caricare un PDF con orari voli (qualsiasi mese, tipo Feb/Mar 2026).
+2. Parsare i voli PAX, anche quando un giorno è spezzato su più tabelle / pagine.
+3. Raggruppare per giorno della settimana.
+4. Visualizzare una matrice voli × date con interfaccia curata e filtri.
+5. Esportare la matrice in CSV.
+6. Visualizzare un grafico a linee Arrivi/Partenze per giorno.
+7. Generare turni guida CCNL con matrice di validità per tipo giorno.
 """
 
 import io
@@ -23,14 +23,19 @@ import streamlit as st
 
 
 # =========================
-# COSTANTI E CONFIGURAZIONE CCNL
+# COSTANTI BASE
 # =========================
 
 WEEKDAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 WEEKDAY_LABELS_IT = {
-    "Mon": "Lunedì", "Tue": "Martedì", "Wed": "Mercoledì",
-    "Thu": "Giovedì", "Fri": "Venerdì", "Sat": "Sabato", "Sun": "Domenica",
+    "Mon": "Lunedì",
+    "Tue": "Martedì",
+    "Wed": "Mercoledì",
+    "Thu": "Giovedì",
+    "Fri": "Venerdì",
+    "Sat": "Sabato",
+    "Sun": "Domenica",
 }
 
 DAY_PATTERN = re.compile(
@@ -42,66 +47,94 @@ MONTH_MAP = {
     "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
 }
 
+# Prefisso italiano per giorno (prime 2 lettere, maiuscole)
 DAY_PREFIX = {
-    "Mon": "LU", "Tue": "MA", "Wed": "ME", "Thu": "GI",
-    "Fri": "VE", "Sat": "SA", "Sun": "DO",
+    "Mon": "LU",
+    "Tue": "MA",
+    "Wed": "ME",
+    "Thu": "GI",
+    "Fri": "VE",
+    "Sat": "SA",
+    "Sun": "DO",
 }
 
-# Tempi fissi
+# =========================
+# CONFIGURAZIONE CCNL / SHUTTLE
+# =========================
+
 TEMPO_VIAGGIO_PCV_APT = 40  # minuti
 TEMPO_VIAGGIO_APT_PCV = 35  # minuti
-PRE_TURNO = 20              # minuti pre-turno
-POST_TURNO = 12             # minuti post-turno
+PRE_TURNO = 20              # minuti pre-turno (10 pre + 10 trasferimento)
+POST_TURNO = 12             # minuti post-turno (10 trasferimento + 2 post)
 PRE_SOSTA_INOP = 5          # minuti pre-sosta inoperosa (pagati 100%)
 POST_SOSTA_INOP = 5         # minuti post-sosta inoperosa (pagati 100%)
 PERCENTUALE_INOPEROSITA = 0.12  # 12%
 
-# Raggruppamento voli
 DEPARTURE_GROUP_DELTA_MIN = 20
 ARRIVAL_GROUP_DELTA_MIN = 20
 
-# Target lavoro
 TARGET_WORK_MIN = 7 * 60  # 7 ore
 
-# Vincoli CCNL per tipo turno
 TURNO_VINCOLI = {
     "Intero": {
-        "nastro_max": 480,      # 8h - nastro = lavoro
-        "pausa_retrib_min": 30,  # pausa retribuita >= 30 min
+        "nastro_max": 480,      # 8h
+        "pausa_retrib_min": 30,
         "priorita": 1,
     },
     "Sosta Inoperosa": {
         "nastro_max": 555,      # 9h15
-        "sosta_apt_min": 30,    # sosta in aeroporto > 30 min
-        "mattina_fine_max": 15*60+15,   # deve finire entro 15:15
-        "pomeriggio_inizio_min": 11*60+50,  # non può iniziare prima 11:50
+        "sosta_apt_min": 30,
+        "mattina_fine_max": 15 * 60 + 15,
+        "pomeriggio_inizio_min": 11 * 60 + 50,
         "priorita": 3,
     },
     "Semiunico": {
         "nastro_max": 540,      # 9h
         "lavoro_max": 500,      # 8h20
-        "pausa_pcv_min": 40,    # pausa non retrib a PCV >= 40 min
-        "pausa_pcv_max": 180,   # pausa non retrib a PCV < 3h
+        "pausa_pcv_min": 40,
+        "pausa_pcv_max": 180,
         "priorita": 2,
     },
     "Spezzato": {
         "nastro_max": 630,      # 10h30
-        "pausa_pcv_min": 180,   # pausa non retrib a PCV >= 3h
+        "pausa_pcv_min": 180,
         "priorita": 2,
     },
     "Supplemento": {
-        "nastro_max": 180,      # 3h - nastro = lavoro
+        "nastro_max": 180,      # 3h
         "priorita": 4,
     },
 }
 
 
 # =========================
-# PARSING PDF
+# UTILITY
+# =========================
+
+def minutes_to_hhmm(m: float) -> str:
+    if m is None:
+        return ""
+    m_int = int(round(m))
+    h = m_int // 60
+    mm = m_int % 60
+    return f"{h:02d}:{mm:02d}"
+
+
+def combine_date_time(d: date, time_str: str) -> Optional[datetime]:
+    if not time_str:
+        return None
+    try:
+        t = datetime.strptime(time_str, "%H:%M").time()
+        return datetime.combine(d, t)
+    except ValueError:
+        return None
+
+
+# =========================
+# PARSING PDF VOLI
 # =========================
 
 def parse_pdf_to_flights_df(file_obj: io.BytesIO) -> pd.DataFrame:
-    """Parser PDF voli"""
     records: List[dict] = []
 
     with pdfplumber.open(file_obj) as pdf:
@@ -139,7 +172,7 @@ def parse_pdf_to_flights_df(file_obj: io.BytesIO) -> pd.DataFrame:
                     month_str = m.group(3)
                     year = int(m.group(4))
                     month_num = MONTH_MAP.get(month_str)
-                    
+
                     if month_num is None:
                         current_date_by_col[col] = None
                         current_weekday_by_col[col] = None
@@ -203,41 +236,125 @@ def parse_pdf_to_flights_df(file_obj: io.BytesIO) -> pd.DataFrame:
 
 
 # =========================
-# COSTRUZIONE CORSE BUS
+# MATRICE VOLI (come prima)
 # =========================
 
-def combine_date_time(d: date, time_str: str) -> Optional[datetime]:
-    if not time_str:
-        return None
-    try:
-        t = datetime.strptime(time_str, "%H:%M").time()
-        return datetime.combine(d, t)
-    except ValueError:
-        return None
+def compute_time_value(row: pd.Series) -> Optional[str]:
+    ad = str(row.get("AD", "")).upper()
+    if ad in ("A", "ARR", "ARRIVAL"):
+        return row.get("ETA") or None
+    if ad in ("P", "D", "DEP", "DEPT", "DEPARTURE"):
+        return row.get("ETD") or None
+    return None
 
+
+def build_matrix_for_weekday(flights: pd.DataFrame, weekday: str) -> pd.DataFrame:
+    if flights.empty:
+        return pd.DataFrame()
+
+    subset = flights[flights["Weekday"] == weekday].copy()
+    if subset.empty:
+        return pd.DataFrame()
+
+    subset["TimeValue"] = subset.apply(compute_time_value, axis=1)
+    subset = subset.dropna(subset=["TimeValue"])
+    if subset.empty:
+        return pd.DataFrame()
+
+    matrix = subset.pivot_table(
+        index=["Flight", "Route", "AD"],
+        columns="Date",
+        values="TimeValue",
+        aggfunc="first",
+    )
+
+    matrix = matrix.reindex(sorted(matrix.columns), axis=1)
+    matrix = matrix.reset_index()
+
+    new_cols = []
+    for c in matrix.columns:
+        if isinstance(c, date):
+            new_cols.append(c.strftime("%d-%m"))
+        else:
+            new_cols.append(c)
+    matrix.columns = new_cols
+
+    matrix = matrix.sort_values(by=["Flight", "Route", "AD"]).reset_index(drop=True)
+    return matrix
+
+
+def style_ad(val: str) -> str:
+    if val == "P":
+        return "color: #f97373;"
+    if val == "A":
+        return "color: #4ade80;"
+    return ""
+
+
+def style_time(row: pd.Series):
+    ad = row.get("AD", None)
+    color = None
+    if ad == "P":
+        color = "#f97373"
+    elif ad == "A":
+        color = "#4ade80"
+
+    styles = []
+    for col in row.index:
+        if col in ("Codice Volo", "Aeroporto", "AD"):
+            styles.append("")
+            continue
+        if pd.notna(row[col]) and row[col] != "" and color is not None:
+            styles.append(f"color: {color};")
+        else:
+            styles.append("")
+    return styles
+
+
+# =========================
+# FILTRI VOLI → INPUT PER TURNI
+# =========================
+
+def filter_flights_for_turns(
+    flights_df: pd.DataFrame,
+    weekday: str,
+    flight_filter: str,
+    selected_airports: List[str],
+    ad_choice: str,
+) -> pd.DataFrame:
+    subset = flights_df[flights_df["Weekday"] == weekday].copy()
+
+    if flight_filter:
+        subset = subset[
+            subset["Flight"].str.contains(flight_filter, case=False, na=False)
+        ]
+
+    if selected_airports:
+        subset = subset[subset["Route"].isin(selected_airports)]
+
+    if ad_choice == "Solo arrivi (A)":
+        subset = subset[subset["AD"] == "A"]
+    elif ad_choice == "Solo partenze (P)":
+        subset = subset[subset["AD"] == "P"]
+
+    return subset
+
+
+# =========================
+# COSTRUZIONE LEGS E ROUNDTRIP (COPERTURA 100%)
+# =========================
 
 def build_all_bus_legs(filtered_flights: pd.DataFrame) -> List[dict]:
-    """
-    Costruisce TUTTI i legs bus (singole tratte PCV→APT o APT→PCV).
-    Ogni leg rappresenta una CORSA EFFETTIVA che DEVE essere coperta.
-    
-    Returns:
-        Lista di legs, ognuno con:
-        - id: identificativo univoco
-        - Date, Direction, service_start, service_end
-        - flights: lista codici volo serviti
-        - ad_type: 'P' (partenza) o 'A' (arrivo)
-    """
     legs: List[dict] = []
     leg_id = 0
-    
+
     if filtered_flights.empty:
         return legs
 
     for d in sorted(filtered_flights["Date"].unique()):
         day_rows = filtered_flights[filtered_flights["Date"] == d]
 
-        # PARTENZE: PCV → APT (bus porta passeggeri al volo)
+        # PARTENZE: PCV → APT
         dep_rows = day_rows[day_rows["AD"] == "P"].copy()
         if not dep_rows.empty:
             dep_rows["flight_dt"] = dep_rows["ETD"].apply(lambda s: combine_date_time(d, s))
@@ -275,7 +392,7 @@ def build_all_bus_legs(filtered_flights: pd.DataFrame) -> List[dict]:
                 leg_id += 1
                 i = j
 
-        # ARRIVI: APT → PCV (bus riporta passeggeri)
+        # ARRIVI: APT → PCV
         arr_rows = day_rows[day_rows["AD"] == "A"].copy()
         if not arr_rows.empty:
             arr_rows["flight_dt"] = arr_rows["ETA"].apply(lambda s: combine_date_time(d, s))
@@ -317,20 +434,10 @@ def build_all_bus_legs(filtered_flights: pd.DataFrame) -> List[dict]:
 
 
 def build_roundtrips_ensuring_coverage(legs: List[dict]) -> Tuple[List[dict], List[str]]:
-    """
-    Costruisce roundtrips (andata+ritorno) garantendo che OGNI leg sia coperto.
-    
-    Logica:
-    1. Accoppia PCV-APT con il primo APT-PCV disponibile successivo
-    2. Per legs spaiati, crea roundtrip con fuorilinea (corsa a vuoto)
-    
-    Returns:
-        (roundtrips, warnings)
-    """
     roundtrips: List[dict] = []
     warnings: List[str] = []
     rt_id = 0
-    
+
     if not legs:
         return roundtrips, warnings
 
@@ -338,34 +445,32 @@ def build_roundtrips_ensuring_coverage(legs: List[dict]) -> Tuple[List[dict], Li
         day_legs = [leg for leg in legs if leg["Date"] == d]
         pcv_apt_legs = [leg for leg in day_legs if leg["Direction"] == "PCV-APT"]
         apt_pcv_legs = [leg for leg in day_legs if leg["Direction"] == "APT-PCV"]
-        
+
         pcv_apt_legs = sorted(pcv_apt_legs, key=lambda x: x["service_start"])
         apt_pcv_legs = sorted(apt_pcv_legs, key=lambda x: x["service_start"])
-        
+
         used_apt_pcv = [False] * len(apt_pcv_legs)
         used_pcv_apt = [False] * len(pcv_apt_legs)
-        
-        # FASE 1: Accoppia PCV-APT con APT-PCV
+
+        # Fase 1: accoppia PCV-APT con APT-PCV
         for idx_out, out_leg in enumerate(pcv_apt_legs):
             best_match = None
             best_idx = None
-            
+
             for idx_ret, ret_leg in enumerate(apt_pcv_legs):
                 if used_apt_pcv[idx_ret]:
                     continue
-                # Il ritorno deve partire DOPO che l'andata è arrivata
                 if ret_leg["service_start"] >= out_leg["service_end"]:
                     best_match = ret_leg
                     best_idx = idx_ret
-                    break  # Prendi il primo disponibile
-            
+                    break
+
             if best_match:
                 used_pcv_apt[idx_out] = True
                 used_apt_pcv[best_idx] = True
-                
-                # Calcola tempo inoperoso in aeroporto
+
                 sosta_apt = (best_match["service_start"] - out_leg["service_end"]).total_seconds() / 60.0
-                
+
                 roundtrips.append({
                     "id": rt_id,
                     "Date": d,
@@ -378,18 +483,17 @@ def build_roundtrips_ensuring_coverage(legs: List[dict]) -> Tuple[List[dict], Li
                     "legs_covered": [out_leg["id"], best_match["id"]],
                 })
                 rt_id += 1
-        
-        # FASE 2: PCV-APT spaiati → crea fuorilinea per ritorno
+
+        # Fase 2: PCV-APT spaiati → fuorilinea per ritorno
         for idx_out, out_leg in enumerate(pcv_apt_legs):
             if used_pcv_apt[idx_out]:
                 continue
-            
-            # Crea leg fittizio APT→PCV
+
             fake_start = out_leg["service_end"] + timedelta(minutes=10)
             fake_end = fake_start + timedelta(minutes=TEMPO_VIAGGIO_APT_PCV)
-            
+
             fake_ret = {
-                "id": -1,  # ID negativo = fuorilinea
+                "id": -1,
                 "Date": d,
                 "Direction": "APT-PCV",
                 "service_start": fake_start,
@@ -398,7 +502,7 @@ def build_roundtrips_ensuring_coverage(legs: List[dict]) -> Tuple[List[dict], Li
                 "ad_type": "X",
                 "routes": ["---"],
             }
-            
+
             roundtrips.append({
                 "id": rt_id,
                 "Date": d,
@@ -412,16 +516,15 @@ def build_roundtrips_ensuring_coverage(legs: List[dict]) -> Tuple[List[dict], Li
             })
             rt_id += 1
             warnings.append(f"⚠️ Fuorilinea ritorno per voli {','.join(out_leg['flights'])} ({d.strftime('%d/%m')})")
-        
-        # FASE 3: APT-PCV spaiati → crea fuorilinea per andata
+
+        # Fase 3: APT-PCV spaiati → fuorilinea per andata
         for idx_ret, ret_leg in enumerate(apt_pcv_legs):
             if used_apt_pcv[idx_ret]:
                 continue
-            
-            # Crea leg fittizio PCV→APT
+
             fake_end = ret_leg["service_start"] - timedelta(minutes=10)
             fake_start = fake_end - timedelta(minutes=TEMPO_VIAGGIO_PCV_APT)
-            
+
             fake_out = {
                 "id": -1,
                 "Date": d,
@@ -432,7 +535,7 @@ def build_roundtrips_ensuring_coverage(legs: List[dict]) -> Tuple[List[dict], Li
                 "ad_type": "X",
                 "routes": ["---"],
             }
-            
+
             roundtrips.append({
                 "id": rt_id,
                 "Date": d,
@@ -446,63 +549,58 @@ def build_roundtrips_ensuring_coverage(legs: List[dict]) -> Tuple[List[dict], Li
             })
             rt_id += 1
             warnings.append(f"⚠️ Fuorilinea andata per voli {','.join(ret_leg['flights'])} ({d.strftime('%d/%m')})")
-    
+
     return sorted(roundtrips, key=lambda x: x["start"]), warnings
 
 
 # =========================
-# CALCOLO LAVORO E CLASSIFICAZIONE TURNI
+# CALCOLO METRICHE TURNO + CLASSIFICAZIONE
 # =========================
 
 def calcola_metriche_turno(corse: List[dict]) -> Dict:
-    """
-    Calcola le metriche di un turno secondo normativa CCNL.
-    
-    Lavoro = Corsa + Pre/Post turno + Fuori linea + Inoperosità (12% con 5+5 pre/post)
-    """
     if not corse:
-        return {"nastro": 0, "lavoro": 0, "sosta_apt_max": 0, "gap_pcv_max": 0}
-    
+        return {
+            "nastro": 0,
+            "lavoro": 0,
+            "sosta_apt_max": 0,
+            "gap_pcv_max": 0,
+            "gaps_pcv": [],
+            "shift_start": None,
+            "shift_end": None,
+        }
+
     corse = sorted(corse, key=lambda x: x["start"])
-    
-    # Nastro: da inizio prima corsa (con pre) a fine ultima (con post)
+
     shift_start = corse[0]["start"] - timedelta(minutes=PRE_TURNO)
     shift_end = corse[-1]["end"] + timedelta(minutes=POST_TURNO)
     nastro_min = (shift_end - shift_start).total_seconds() / 60.0
-    
-    # Tempo guida effettivo
+
     tempo_guida = 0
     for c in corse:
-        # Andata
         tempo_guida += TEMPO_VIAGGIO_PCV_APT
-        # Ritorno
         tempo_guida += TEMPO_VIAGGIO_APT_PCV
-    
-    # Inoperosità in aeroporto (solo se > 30 min)
+
     inoperosita = 0
     sosta_apt_max = 0
     for c in corse:
         sosta = c.get("sosta_apt_min", 0)
         sosta_apt_max = max(sosta_apt_max, sosta)
         if sosta > 30:
-            # Pre e post sosta (5+5 min pagati 100%) + 12% del resto
             inoperosita += PRE_SOSTA_INOP + POST_SOSTA_INOP
             inoperosita += (sosta - PRE_SOSTA_INOP - POST_SOSTA_INOP) * PERCENTUALE_INOPEROSITA
-    
-    # Gap tra corse a PCV (fuori linea se < 40 min, pausa se >= 40 min)
+
     gaps_pcv = []
     fuori_linea = 0
     for i in range(len(corse) - 1):
         gap = (corse[i + 1]["start"] - corse[i]["end"]).total_seconds() / 60.0
         gaps_pcv.append(gap)
         if gap < 40:
-            fuori_linea += gap  # Tempo considerato lavoro
-    
+            fuori_linea += gap
+
     gap_pcv_max = max(gaps_pcv) if gaps_pcv else 0
-    
-    # Lavoro totale
+
     lavoro = tempo_guida + PRE_TURNO + POST_TURNO + inoperosita + fuori_linea
-    
+
     return {
         "nastro": nastro_min,
         "lavoro": lavoro,
@@ -515,35 +613,28 @@ def calcola_metriche_turno(corse: List[dict]) -> Dict:
 
 
 def classifica_turno(metriche: Dict) -> str:
-    """
-    Classifica il tipo di turno secondo normativa CCNL.
-    Restituisce il tipo più appropriato.
-    """
     nastro = metriche["nastro"]
     lavoro = metriche["lavoro"]
     sosta_apt_max = metriche["sosta_apt_max"]
     gap_pcv_max = metriche["gap_pcv_max"]
     shift_start = metriche.get("shift_start")
     shift_end = metriche.get("shift_end")
-    
-    # SUPPLEMENTO: nastro <= 3h
+
+    # Supplemento
     if nastro <= TURNO_VINCOLI["Supplemento"]["nastro_max"]:
         return "Supplemento"
-    
-    # INTERO: nastro <= 8h, nastro ≈ lavoro, pausa retribuita >= 30 min
+
+    # Intero
     if nastro <= TURNO_VINCOLI["Intero"]["nastro_max"]:
-        # Il turno è "intero" se abbastanza saturo
-        if abs(nastro - lavoro) <= nastro * 0.15:  # differenza max 15%
+        if abs(nastro - lavoro) <= nastro * 0.15:
             return "Intero"
-    
-    # SOSTA INOPEROSA: nastro <= 9:15, sosta in aeroporto > 30 min
+
+    # Sosta Inoperosa
     if nastro <= TURNO_VINCOLI["Sosta Inoperosa"]["nastro_max"]:
         if sosta_apt_max > TURNO_VINCOLI["Sosta Inoperosa"]["sosta_apt_min"]:
-            # Verifica vincoli fascia oraria
             if shift_start and shift_end:
                 start_min = shift_start.hour * 60 + shift_start.minute
                 end_min = shift_end.hour * 60 + shift_end.minute
-                
                 is_mattina = start_min < 12 * 60
                 if is_mattina:
                     if end_min <= TURNO_VINCOLI["Sosta Inoperosa"]["mattina_fine_max"]:
@@ -551,100 +642,75 @@ def classifica_turno(metriche: Dict) -> str:
                 else:
                     if start_min >= TURNO_VINCOLI["Sosta Inoperosa"]["pomeriggio_inizio_min"]:
                         return "Sosta Inoperosa"
-    
-    # SEMIUNICO: nastro <= 9h, pausa a PCV tra 40 min e 3h
+
+    # Semiunico
     if nastro <= TURNO_VINCOLI["Semiunico"]["nastro_max"]:
-        if (TURNO_VINCOLI["Semiunico"]["pausa_pcv_min"] <= gap_pcv_max < 
-            TURNO_VINCOLI["Semiunico"]["pausa_pcv_max"]):
+        if (TURNO_VINCOLI["Semiunico"]["pausa_pcv_min"] <= gap_pcv_max <
+                TURNO_VINCOLI["Semiunico"]["pausa_pcv_max"]):
             if lavoro <= TURNO_VINCOLI["Semiunico"]["lavoro_max"]:
                 return "Semiunico"
-    
-    # SPEZZATO: nastro <= 10:30, pausa a PCV >= 3h
+
+    # Spezzato
     if nastro <= TURNO_VINCOLI["Spezzato"]["nastro_max"]:
         if gap_pcv_max >= TURNO_VINCOLI["Spezzato"]["pausa_pcv_min"]:
             return "Spezzato"
-    
-    # Fallback: se nastro <= 9:15 con sosta aeroporto, è Sosta Inoperosa
+
     if nastro <= TURNO_VINCOLI["Sosta Inoperosa"]["nastro_max"] and sosta_apt_max > 0:
         return "Sosta Inoperosa"
-    
-    # Fallback finale
+
     if nastro <= 480:
         return "Intero"
-    
+
     return "Altro"
 
 
 # =========================
-# ALGORITMO GREEDY OTTIMIZZATO
+# GENERAZIONE TURNI GREEDY PER DATA
 # =========================
 
 def genera_turni_greedy(roundtrips: List[dict], weekday: str, d: date) -> List[dict]:
-    """
-    Genera turni usando algoritmo greedy con priorità CCNL.
-    
-    Strategia:
-    1. Prova a costruire turni Interi (~7h) con 2-3 corse
-    2. Poi Semiunici/Spezzati se ci sono gap lunghi
-    3. Poi Sosta Inoperosa
-    4. Infine Supplementi per corse residue
-    
-    GARANZIA: ogni roundtrip viene assegnato a esattamente un turno.
-    """
     if not roundtrips:
         return []
-    
+
     rts = sorted(roundtrips, key=lambda x: x["start"])
     n = len(rts)
     assigned = [False] * n
     turni: List[dict] = []
-    
+
     def try_build_turno(start_idx: int, max_corse: int = 3) -> Optional[dict]:
-        """Prova a costruire il miglior turno possibile partendo da start_idx."""
         if assigned[start_idx]:
             return None
-        
+
         best_turno = None
         best_score = -1
-        
-        # Prova combinazioni di 1, 2, 3 corse
+
         for num_corse in range(1, min(max_corse + 1, n - start_idx + 1)):
             candidate_indices = [start_idx]
             candidate_corse = [rts[start_idx]]
-            
-            # Trova le prossime corse compatibili
+
             last_end = rts[start_idx]["end"]
             for j in range(start_idx + 1, n):
                 if assigned[j]:
                     continue
                 if len(candidate_indices) >= num_corse:
                     break
-                
-                # Deve essere sequenziale (non sovrapposto)
                 if rts[j]["start"] >= last_end:
                     candidate_indices.append(j)
                     candidate_corse.append(rts[j])
                     last_end = rts[j]["end"]
-            
+
             if len(candidate_corse) < num_corse:
                 continue
-            
-            # Calcola metriche
+
             metriche = calcola_metriche_turno(candidate_corse)
-            
-            # Verifica vincoli di base
             if metriche["nastro"] > TURNO_VINCOLI["Spezzato"]["nastro_max"]:
-                continue  # Nastro troppo lungo
-            
+                continue
+
             tipo = classifica_turno(metriche)
-            
-            # Calcola score (priorità + vicinanza a 7h)
             priorita = TURNO_VINCOLI.get(tipo, {}).get("priorita", 99)
             diff_7h = abs(metriche["lavoro"] - TARGET_WORK_MIN)
-            
-            # Score: priorità alta (numero basso) + lavoro vicino a 7h
             score = (5 - priorita) * 1000 - diff_7h
-            
+
             if score > best_score:
                 best_score = score
                 best_turno = {
@@ -653,20 +719,16 @@ def genera_turni_greedy(roundtrips: List[dict], weekday: str, d: date) -> List[d
                     "metriche": metriche,
                     "tipo": tipo,
                 }
-        
+
         return best_turno
-    
-    # FASE 1: Costruisci turni ottimali
+
     for i in range(n):
         if assigned[i]:
             continue
-        
         turno = try_build_turno(i, max_corse=3)
-        
         if turno:
             for idx in turno["indices"]:
                 assigned[idx] = True
-            
             turni.append({
                 "corse": turno["corse"],
                 "metriche": turno["metriche"],
@@ -674,15 +736,13 @@ def genera_turni_greedy(roundtrips: List[dict], weekday: str, d: date) -> List[d
                 "date": d,
                 "weekday": weekday,
             })
-    
-    # FASE 2: Verifica che tutte le corse siano assegnate
+
+    # corse residue → supplemento
     for i in range(n):
         if not assigned[i]:
-            # Crea turno singolo (Supplemento)
             corsa = rts[i]
             metriche = calcola_metriche_turno([corsa])
             tipo = classifica_turno(metriche)
-            
             turni.append({
                 "corse": [corsa],
                 "metriche": metriche,
@@ -691,44 +751,35 @@ def genera_turni_greedy(roundtrips: List[dict], weekday: str, d: date) -> List[d
                 "weekday": weekday,
             })
             assigned[i] = True
-    
+
     return turni
 
 
 def genera_turni_tutti_giorni(roundtrips: List[dict], weekday: str) -> Tuple[List[dict], Dict]:
-    """
-    Genera turni per tutte le date, poi unifica pattern simili.
-    """
-    # Raggruppa per data
     per_data = defaultdict(list)
     for rt in roundtrips:
         per_data[rt["Date"]].append(rt)
-    
+
     tutti_turni = []
     for d in sorted(per_data.keys()):
         turni_d = genera_turni_greedy(per_data[d], weekday, d)
         tutti_turni.extend(turni_d)
-    
-    # Statistiche
+
     stats = {
         "total_roundtrips": len(roundtrips),
         "total_turni": len(tutti_turni),
         "per_data": {d: len(per_data[d]) for d in per_data},
     }
-    
+
     return tutti_turni, stats
 
 
 def assegna_codici_e_unifica(turni: List[dict], weekday: str) -> List[dict]:
-    """
-    Assegna codici turno e unifica turni con stesso pattern tra date diverse.
-    """
     if not turni:
         return []
-    
+
     prefix = DAY_PREFIX.get(weekday, weekday[:2].upper())
-    
-    # Raggruppa per "signature" (stesso orario e struttura)
+
     def get_signature(t):
         m = t["metriche"]
         return (
@@ -737,44 +788,42 @@ def assegna_codici_e_unifica(turni: List[dict], weekday: str) -> List[dict]:
             m["shift_end"].time(),
             len(t["corse"]),
         )
-    
+
     per_signature = defaultdict(list)
     for t in turni:
         sig = get_signature(t)
         per_signature[sig].append(t)
-    
-    # Ordina signatures: AM poi PM, per orario
-    am_sigs = [(sig, ts) for sig, ts in per_signature.items() 
+
+    am_sigs = [(sig, ts) for sig, ts in per_signature.items()
                if ts[0]["metriche"]["shift_start"].hour < 12]
-    pm_sigs = [(sig, ts) for sig, ts in per_signature.items() 
+    pm_sigs = [(sig, ts) for sig, ts in per_signature.items()
                if ts[0]["metriche"]["shift_start"].hour >= 12]
-    
-    am_sigs.sort(key=lambda x: x[0][1])  # ordina per orario
+
+    am_sigs.sort(key=lambda x: x[0][1])
     pm_sigs.sort(key=lambda x: x[0][1])
-    
+
     turni_unificati = []
-    
-    # Assegna codici AM (01-49)
+
+    # AM: 01–49
     for idx, (sig, turni_list) in enumerate(am_sigs, start=1):
         sample = turni_list[0]
         n_corse = len(sample["corse"])
         suffix = "I" if n_corse >= 3 else ("P" if n_corse == 2 else "S")
         code = f"{prefix}{idx:02d}{suffix}"
-        
-        # Costruisci dettaglio corse
+
         detail_lines = []
         for c in sample["corse"]:
             out = c["out_leg"]
             ret = c["ret_leg"]
             detail_lines.append(
-                f"{out['service_start'].strftime('%H:%M')}, Piazza Cavour, Aeroporto, "
+                f"{out['service_start'].strftime('%H:%M')},Piazza Cavour, Aeroporto, "
                 f"{out['service_end'].strftime('%H:%M')}, {','.join(out['flights'])}"
             )
             detail_lines.append(
-                f"{ret['service_start'].strftime('%H:%M')}, Aeroporto, Piazza Cavour, "
+                f"{ret['service_start'].strftime('%H:%M')},Aeroporto, Piazza Cavour, "
                 f"{ret['service_end'].strftime('%H:%M')}, {','.join(ret['flights'])}"
             )
-        
+
         turni_unificati.append({
             "code": code,
             "weekday": weekday,
@@ -786,29 +835,28 @@ def assegna_codici_e_unifica(turni: List[dict], weekday: str) -> List[dict]:
             "n_corse": n_corse,
             "date_valide": sorted([t["date"] for t in turni_list]),
             "detail": "\n".join(detail_lines),
-            "corse_ids": [c["id"] for c in sample["corse"]],
         })
-    
-    # Assegna codici PM (50-99)
+
+    # PM: 50–99
     for idx, (sig, turni_list) in enumerate(pm_sigs, start=50):
         sample = turni_list[0]
         n_corse = len(sample["corse"])
         suffix = "I" if n_corse >= 3 else ("P" if n_corse == 2 else "S")
         code = f"{prefix}{idx:02d}{suffix}"
-        
+
         detail_lines = []
         for c in sample["corse"]:
             out = c["out_leg"]
             ret = c["ret_leg"]
             detail_lines.append(
-                f"{out['service_start'].strftime('%H:%M')}, Piazza Cavour, Aeroporto, "
+                f"{out['service_start'].strftime('%H:%M')},Piazza Cavour, Aeroporto, "
                 f"{out['service_end'].strftime('%H:%M')}, {','.join(out['flights'])}"
             )
             detail_lines.append(
-                f"{ret['service_start'].strftime('%H:%M')}, Aeroporto, Piazza Cavour, "
+                f"{ret['service_start'].strftime('%H:%M')},Aeroporto, Piazza Cavour, "
                 f"{ret['service_end'].strftime('%H:%M')}, {','.join(ret['flights'])}"
             )
-        
+
         turni_unificati.append({
             "code": code,
             "weekday": weekday,
@@ -820,146 +868,47 @@ def assegna_codici_e_unifica(turni: List[dict], weekday: str) -> List[dict]:
             "n_corse": n_corse,
             "date_valide": sorted([t["date"] for t in turni_list]),
             "detail": "\n".join(detail_lines),
-            "corse_ids": [c["id"] for c in sample["corse"]],
         })
-    
+
     return sorted(turni_unificati, key=lambda x: x["shift_start"])
 
 
-# =========================
-# PIPELINE PRINCIPALE
-# =========================
-
 def genera_turni_completo(filtered_flights: pd.DataFrame, weekday: str) -> Tuple[List[dict], Dict, List[str]]:
-    """
-    Pipeline completa:
-    1. Costruisce legs (singole tratte)
-    2. Costruisce roundtrips (coppie andata-ritorno)
-    3. Genera turni garantendo copertura 100%
-    4. Unifica e assegna codici
-    
-    Returns:
-        (turni_finali, statistiche, warnings)
-    """
-    warnings = []
-    
-    # Step 1: Costruisci tutti i legs
+    warnings: List[str] = []
+
     legs = build_all_bus_legs(filtered_flights)
     if not legs:
         return [], {"error": "Nessun leg generato"}, warnings
-    
-    # Step 2: Costruisci roundtrips
+
     roundtrips, rt_warnings = build_roundtrips_ensuring_coverage(legs)
     warnings.extend(rt_warnings)
-    
+
     if not roundtrips:
         return [], {"error": "Nessun roundtrip generato"}, warnings
-    
-    # Step 3: Genera turni
+
     turni_raw, stats = genera_turni_tutti_giorni(roundtrips, weekday)
-    
     if not turni_raw:
         return [], {"error": "Nessun turno generato"}, warnings
-    
-    # Step 4: Unifica e assegna codici
+
     turni_finali = assegna_codici_e_unifica(turni_raw, weekday)
-    
-    # Calcola statistiche finali
+
     stats["legs_totali"] = len(legs)
     stats["roundtrips_totali"] = len(roundtrips)
     stats["turni_finali"] = len(turni_finali)
     stats["fuorilinea"] = len(rt_warnings)
-    
-    # Verifica copertura
+
     corse_coperte = set()
     for t in turni_raw:
         for c in t["corse"]:
             for leg_id in c.get("legs_covered", []):
                 corse_coperte.add(leg_id)
-    
+
     legs_reali = [l for l in legs if l["id"] >= 0]
     stats["legs_coperti"] = len(corse_coperte)
     stats["legs_reali"] = len(legs_reali)
     stats["copertura_pct"] = (len(corse_coperte) / len(legs_reali) * 100) if legs_reali else 100
-    
+
     return turni_finali, stats, warnings
-
-
-def genera_analisi(turni: List[dict], stats: Dict, weekday: str) -> str:
-    """Genera analisi testuale dei turni."""
-    if not turni:
-        return "Nessun turno generato."
-    
-    lines = []
-    lines.append(f"## 📊 Analisi Turni - {WEEKDAY_LABELS_IT.get(weekday, weekday)}")
-    lines.append("")
-    
-    # Copertura
-    lines.append(f"### Copertura")
-    lines.append(f"- Legs totali: {stats.get('legs_totali', 'N/A')}")
-    lines.append(f"- Roundtrips: {stats.get('roundtrips_totali', 'N/A')}")
-    lines.append(f"- Copertura: {stats.get('copertura_pct', 0):.1f}%")
-    if stats.get('fuorilinea', 0) > 0:
-        lines.append(f"- ⚠️ Fuorilinea: {stats.get('fuorilinea')}")
-    lines.append("")
-    
-    # Turni
-    lines.append(f"### Turni Generati")
-    lines.append(f"- Totale: {len(turni)}")
-    
-    per_tipo = defaultdict(int)
-    for t in turni:
-        per_tipo[t["tipo_turno"]] += 1
-    
-    for tipo in ["Intero", "Semiunico", "Spezzato", "Sosta Inoperosa", "Supplemento"]:
-        if per_tipo[tipo] > 0:
-            lines.append(f"- {tipo}: {per_tipo[tipo]}")
-    lines.append("")
-    
-    # Metriche lavoro
-    lavori = [t["lavoro_min"] for t in turni]
-    nastri = [t["nastro_min"] for t in turni]
-    
-    if lavori:
-        avg_lavoro = sum(lavori) / len(lavori)
-        lines.append(f"### Metriche Lavoro")
-        lines.append(f"- Media lavoro: {int(avg_lavoro // 60)}h {int(avg_lavoro % 60)}min")
-        lines.append(f"- Min: {int(min(lavori) // 60)}h {int(min(lavori) % 60)}min")
-        lines.append(f"- Max: {int(max(lavori) // 60)}h {int(max(lavori) % 60)}min")
-        lines.append("")
-    
-    # Validità multi-giorno
-    validita = [len(t["date_valide"]) for t in turni]
-    n_date = len(set(d for t in turni for d in t["date_valide"]))
-    
-    if validita and n_date > 0:
-        avg_val = sum(validita) / len(validita)
-        tutti_giorni = sum(1 for v in validita if v == n_date)
-        lines.append(f"### Validità Multi-Giorno")
-        lines.append(f"- Date coperte: {n_date}")
-        lines.append(f"- Validità media: {avg_val:.1f} giorni")
-        lines.append(f"- Turni validi tutti i giorni: {tutti_giorni} ({tutti_giorni/len(turni)*100:.0f}%)")
-        lines.append("")
-    
-    # Valutazione
-    lines.append(f"### Valutazione")
-    
-    if per_tipo.get("Intero", 0) >= len(turni) * 0.4:
-        lines.append("- ✅ Buona percentuale di turni Interi")
-    else:
-        lines.append("- ⚠️ Pochi turni Interi - verificare ottimizzazione")
-    
-    if lavori and sum(lavori) / len(lavori) >= 380 and sum(lavori) / len(lavori) <= 480:
-        lines.append("- ✅ Lavoro medio in linea con target 7-8h")
-    elif lavori and sum(lavori) / len(lavori) < 380:
-        lines.append("- ⚠️ Lavoro medio sotto le 6:30h")
-    
-    if stats.get('fuorilinea', 0) == 0:
-        lines.append("- ✅ Nessun fuorilinea necessario")
-    else:
-        lines.append(f"- ⚠️ {stats.get('fuorilinea')} corse fuorilinea - valutare alternative")
-    
-    return "\n".join(lines)
 
 
 # =========================
@@ -968,20 +917,65 @@ def genera_analisi(turni: List[dict], stats: Dict, weekday: str) -> str:
 
 def main():
     st.set_page_config(
-        page_title="Turni Shuttle Aeroporto",
-        page_icon="🚌",
+        page_title="Flight Matrix",
+        page_icon="✈️",
         layout="wide",
     )
 
-    st.markdown("""
+    # CSS
+    st.markdown(
+        """
         <style>
-        .block-container { padding: 1.5rem 2rem; }
+        .block-container {
+            padding-top: 1.5rem;
+            padding-bottom: 2rem;
+            padding-left: 2rem;
+            padding-right: 2rem;
+        }
         h1 { text-align: center; }
         .info-card {
             background: rgba(15,23,42,0.9);
             padding: 1rem 1.2rem;
             border-radius: 0.9rem;
             border: 1px solid rgba(148,163,184,0.35);
+        }
+        .day-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.25rem 0.75rem;
+            border-radius: 999px;
+            border: 1px solid rgba(148,163,184,0.8);
+            background: rgba(15,23,42,0.9);
+            font-size: 0.9rem;
+            gap: 0.4rem;
+        }
+        .day-dot {
+            width: 0.6rem;
+            height: 0.6rem;
+            border-radius: 999px;
+            background: #38bdf8;
+        }
+        .legend-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.25rem 0.6rem;
+            border-radius: 999px;
+            border: 1px solid rgba(148,163,184,0.4);
+            font-size: 0.8rem;
+            margin-right: 0.4rem;
+        }
+        .legend-color-arr {
+            width: 0.9rem;
+            height: 0.35rem;
+            border-radius: 999px;
+            background: #4ade80;
+        }
+        .legend-color-dep {
+            width: 0.9rem;
+            height: 0.35rem;
+            border-radius: 999px;
+            background: #f97373;
         }
         .success-box {
             background: linear-gradient(135deg, rgba(34,197,94,0.15), rgba(22,163,74,0.15));
@@ -996,215 +990,302 @@ def main():
             border: 1px solid rgba(245,158,11,0.4);
         }
         </style>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
-    st.title("🚌 Generatore Turni Shuttle Aeroporto")
+    st.title("✈️ Flight Matrix")
 
-    st.markdown("""
-        <div class="info-card">
-            <p><strong>Sistema di ottimizzazione turni con vincoli CCNL</strong></p>
-            <ul style="margin-top:0.5rem; margin-bottom:0;">
-                <li>✅ <strong>Copertura 100% garantita</strong> - tutte le corse vengono assegnate</li>
-                <li>📋 Tipi turno: Intero, Semiunico, Spezzato, Sosta Inoperosa, Supplemento</li>
-                <li>🎯 Target lavoro: ~7 ore per turno</li>
-                <li>📅 Massimizzazione validità multi-giorno</li>
-            </ul>
-        </div>
-    """, unsafe_allow_html=True)
+    with st.container():
+        st.markdown(
+            """
+            <div class="info-card">
+                <p>🛫🛬 <strong>Carica il PDF con gli orari dei voli</strong>.</p>
+                <p style="margin-top:0.35rem;">L'app:</p>
+                <ul style="margin-top:0.15rem;">
+                    <li>considera <strong>solo voli passeggeri (PAX)</strong></li>
+                    <li>esclude i voli <strong>CARGO</strong></li>
+                    <li>raggruppa per <strong>giorno della settimana</strong></li>
+                    <li>mostra una <strong>matrice</strong> voli × date</li>
+                    <li>genera <strong>turni guida</strong> CCNL con matrice di validità</li>
+                </ul>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     st.write("")
-
-    uploaded_file = st.file_uploader("📄 Carica il PDF con gli orari dei voli", type=["pdf"])
+    uploaded_file = st.file_uploader("Carica il PDF con gli orari dei voli", type=["pdf"])
 
     if uploaded_file is None:
         st.info("Carica il PDF per procedere.")
-        
-        with st.expander("📋 Normativa CCNL Implementata"):
-            st.markdown("""
-            | Tipo Turno | Nastro Max | Caratteristiche |
-            |------------|------------|-----------------|
-            | **Intero** | 8h | Nastro ≈ Lavoro, pausa retribuita ≥30min |
-            | **Semiunico** | 9h | Pausa non retrib. a PCV 40min-3h |
-            | **Spezzato** | 10h30 | Pausa non retrib. a PCV ≥3h |
-            | **Sosta Inoperosa** | 9h15 | Sosta in aeroporto >30min (retrib. 12%) |
-            | **Supplemento** | 3h | Turni brevi |
-            
-            **Calcolo Lavoro:**
-            - Tempo guida (corsa)
-            - Pre turno: 20 min
-            - Post turno: 12 min
-            - Inoperosità APT: 5+5 min (100%) + resto al 12%
-            """)
         return
 
-    with st.spinner("Parsing del PDF..."):
+    with st.spinner("Parsing del PDF in corso..."):
         flights_df = parse_pdf_to_flights_df(uploaded_file)
 
     if flights_df.empty:
-        st.error("❌ Nessun volo PAX trovato.")
+        st.error("Non sono stati trovati voli PAX o la struttura del PDF non è riconosciuta.")
         return
 
     unique_days = sorted(flights_df["Date"].unique())
+    num_days = len(unique_days)
+    num_flights = len(flights_df)
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
-        st.metric("Voli PAX", len(flights_df))
+        st.metric("Voli PAX estratti", num_flights)
     with col2:
-        st.metric("Giorni", len(unique_days))
+        st.metric("Giorni coperti", num_days)
     with col3:
-        st.write(f"📆 **{unique_days[0].strftime('%d/%m/%Y')} – {unique_days[-1].strftime('%d/%m/%Y')}**")
+        if num_days > 0:
+            start = unique_days[0]
+            end = unique_days[-1]
+            st.write(
+                f"📆 Periodo: **{start.strftime('%d/%m/%Y')} – {end.strftime('%d/%m/%Y')}**"
+            )
 
-    st.success("✅ PDF caricato")
+    st.success("Parsing completato.")
 
-    # Selezione giorno
     weekdays_present = sorted(
         flights_df["Weekday"].unique(),
         key=lambda x: WEEKDAY_ORDER.index(x),
     )
 
-    st.sidebar.header("⚙️ Configurazione")
+    st.sidebar.header("Filtro giorno")
     selected_weekday = st.sidebar.selectbox(
-        "Giorno della settimana",
+        "Seleziona giorno della settimana",
         options=weekdays_present,
         format_func=lambda x: WEEKDAY_LABELS_IT.get(x, x),
     )
 
-    # Filtra voli
-    filtered = flights_df[flights_df["Weekday"] == selected_weekday].copy()
-    
-    label_it = WEEKDAY_LABELS_IT.get(selected_weekday, selected_weekday)
-    st.markdown(f"### 📅 {label_it}")
-    st.write(f"Voli: {len(filtered)} su {filtered['Date'].nunique()} date")
+    matrix_df = build_matrix_for_weekday(flights_df, selected_weekday)
+    if matrix_df.empty:
+        st.warning("Per il giorno selezionato non sono stati trovati voli PAX con orari validi.")
+        return
 
-    # GENERAZIONE TURNI
-    st.markdown("---")
-    
-    if st.button("🚀 Genera Turni", type="primary", use_container_width=True):
-        with st.spinner("Generazione turni in corso..."):
-            turni, stats, warnings = genera_turni_completo(filtered, selected_weekday)
-        
-        if not turni:
-            st.error(f"❌ Errore: {stats.get('error', 'Sconosciuto')}")
-            return
-        
-        # COPERTURA
-        copertura = stats.get('copertura_pct', 0)
-        if copertura >= 100:
-            st.markdown(f"""
-                <div class="success-box">
-                    ✅ <strong>COPERTURA 100%</strong> - Tutte le {stats.get('legs_totali', 0)} corse sono coperte
-                </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-                <div class="warning-box">
-                    ⚠️ <strong>COPERTURA {copertura:.1f}%</strong> - {stats.get('legs_coperti', 0)}/{stats.get('legs_reali', 0)} corse coperte
-                </div>
-            """, unsafe_allow_html=True)
-        
-        # WARNINGS (fuorilinea)
-        if warnings:
-            with st.expander(f"⚠️ {len(warnings)} Corse Fuorilinea"):
-                for w in warnings:
-                    st.write(w)
-        
-        # STATISTICHE
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Turni", len(turni))
-        col2.metric("Corse (legs)", stats.get('legs_totali', 0))
-        col3.metric("Roundtrips", stats.get('roundtrips_totali', 0))
-        col4.metric("Fuorilinea", stats.get('fuorilinea', 0))
-        
-        # MATRICE VALIDITÀ
-        st.markdown("### 📊 Matrice Turni × Validità")
-        
-        dates_list = sorted(filtered["Date"].unique())
-        
-        rows = []
-        for t in turni:
-            nastro_h = int(t["nastro_min"] // 60)
-            nastro_m = int(t["nastro_min"] % 60)
-            lavoro_h = int(t["lavoro_min"] // 60)
-            lavoro_m = int(t["lavoro_min"] % 60)
-            
-            row = {
-                "Codice": t["code"],
-                "Tipo": t["tipo_turno"],
-                "Inizio": t["shift_start"].strftime("%H:%M"),
-                "Fine": t["shift_end"].strftime("%H:%M"),
-                "Nastro": f"{nastro_h}:{nastro_m:02d}",
-                "Lavoro": f"{lavoro_h}:{lavoro_m:02d}",
-                "Corse": t["n_corse"],
-            }
-            
-            for d in dates_list:
-                col_name = d.strftime("%d-%m")
-                row[col_name] = "✅" if d in t["date_valide"] else ""
-            
-            rows.append(row)
-        
-        df_matrix = pd.DataFrame(rows)
-        
-        # Styling
-        def style_tipo(val):
-            colors = {
-                "Intero": "background-color: rgba(34, 197, 94, 0.3)",
-                "Semiunico": "background-color: rgba(59, 130, 246, 0.3)",
-                "Spezzato": "background-color: rgba(168, 85, 247, 0.3)",
-                "Sosta Inoperosa": "background-color: rgba(251, 191, 36, 0.3)",
-                "Supplemento": "background-color: rgba(156, 163, 175, 0.3)",
-            }
-            return colors.get(val, "")
-        
-        styled = df_matrix.style.applymap(style_tipo, subset=["Tipo"])
-        st.dataframe(styled, use_container_width=True, height=500)
-        
-        # Download
-        csv = df_matrix.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Scarica CSV",
-            data=csv,
-            file_name=f"turni_{label_it.lower()}.csv",
-            mime="text/csv",
+    label_it = WEEKDAY_LABELS_IT.get(selected_weekday, selected_weekday)
+    weekday_ops = flights_df[flights_df["Weekday"] == selected_weekday]
+    weekday_flights_count = len(weekday_ops)
+    weekday_dates_count = weekday_ops["Date"].nunique()
+
+    st.markdown(
+        f"""
+        <div style="margin-top: 1.2rem; margin-bottom: 0.3rem;">
+            <span class="day-badge">
+                <span class="day-dot"></span>
+                <span>{label_it}</span>
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        f"**Voli PAX per questo tipo di giorno:** {weekday_flights_count} "
+        f"(su {weekday_dates_count} {label_it.lower()} nel periodo caricato)"
+    )
+
+    st.markdown(
+        """
+        <div style="margin-bottom: 0.6rem; margin-top: 0.2rem;">
+            <span class="legend-pill">
+                <span class="legend-color-arr"></span>
+                <span>Arrivi (A)</span>
+            </span>
+            <span class="legend-pill">
+                <span class="legend-color-dep"></span>
+                <span>Partenze (P)</span>
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # --------- FILTRI MATRICE VOLI ---------
+    with st.expander("Filtri matrice", expanded=False):
+        flight_filter = st.text_input(
+            "Filtra per Codice Volo (contiene)",
+            key="flt_flight",
+            placeholder="Es. FR, EN8, DX1702..."
         )
-        
-        # LEGENDA
-        st.markdown("**Legenda:**")
-        cols = st.columns(5)
-        legend = [
-            ("🟢 Intero", "≤8h"),
-            ("🔵 Semiunico", "≤9h"),
-            ("🟣 Spezzato", "≤10:30"),
-            ("🟡 Sosta Inop.", "≤9:15"),
-            ("⚪ Suppl.", "≤3h"),
+
+        airport_options = sorted(matrix_df["Route"].unique())
+        selected_airports = st.multiselect(
+            "Filtra per Aeroporto",
+            options=airport_options,
+            key="flt_airport",
+        )
+
+        ad_choice = st.radio(
+            "Tipo di movimento",
+            ["Arrivi e partenze", "Solo arrivi (A)", "Solo partenze (P)"],
+            horizontal=True,
+            key="flt_ad",
+        )
+
+    matrix_filtered = matrix_df.copy()
+
+    if flight_filter:
+        matrix_filtered = matrix_filtered[
+            matrix_filtered["Flight"].str.contains(flight_filter, case=False, na=False)
         ]
-        for col, (nome, desc) in zip(cols, legend):
-            col.write(f"**{nome}** {desc}")
-        
-        # DETTAGLIO TURNO
-        st.markdown("---")
-        st.markdown("### 🔍 Dettaglio Turno")
-        
-        selected_code = st.selectbox("Seleziona turno", [t["code"] for t in turni])
-        
-        if selected_code:
-            t_sel = next(t for t in turni if t["code"] == selected_code)
-            
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Tipo", t_sel["tipo_turno"])
-            col2.metric("Nastro", f"{int(t_sel['nastro_min']//60)}h {int(t_sel['nastro_min']%60)}min")
-            col3.metric("Lavoro", f"{int(t_sel['lavoro_min']//60)}h {int(t_sel['lavoro_min']%60)}min")
-            
-            st.markdown("**Dettaglio corse:**")
-            st.text(t_sel["detail"])
-            
-            st.markdown(f"**Validità:** {len(t_sel['date_valide'])} giorni")
-            st.write(", ".join(d.strftime("%d/%m") for d in t_sel["date_valide"]))
-        
-        # ANALISI
-        st.markdown("---")
-        analisi = genera_analisi(turni, stats, selected_weekday)
-        st.markdown(analisi)
+    if selected_airports:
+        matrix_filtered = matrix_filtered[
+            matrix_filtered["Route"].isin(selected_airports)
+        ]
+    if ad_choice == "Solo arrivi (A)":
+        matrix_filtered = matrix_filtered[matrix_filtered["AD"] == "A"]
+    elif ad_choice == "Solo partenze (P)":
+        matrix_filtered = matrix_filtered[matrix_filtered["AD"] == "P"]
+
+    if matrix_filtered.empty:
+        st.warning("Nessun volo corrisponde ai filtri impostati.")
+        return
+
+    display_df = matrix_filtered.rename(
+        columns={"Flight": "Codice Volo", "Route": "Aeroporto"}
+    )
+
+    if "AD" in display_df.columns:
+        styled_df = (
+            display_df
+            .style
+            .apply(style_time, axis=1)
+            .applymap(style_ad, subset=["AD"])
+        )
+    else:
+        styled_df = display_df.style
+
+    st.dataframe(styled_df, use_container_width=True, height=650)
+
+    csv_buffer = display_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Scarica matrice in CSV",
+        data=csv_buffer,
+        file_name=f"flight_matrix_{label_it.lower()}.csv",
+        mime="text/csv",
+    )
+
+    # --------- TURNI GUIDA + MATRICE VALIDITÀ ---------
+    st.markdown("### Turni guida e matrice di validità")
+
+    if st.button("Genera turni guida per questo tipo di giorno"):
+        flights_for_turns = filter_flights_for_turns(
+            flights_df,
+            selected_weekday,
+            flight_filter,
+            selected_airports,
+            ad_choice,
+        )
+
+        if flights_for_turns.empty:
+            st.warning("Nessun volo disponibile per generare i turni guida con i filtri correnti.")
+        else:
+            with st.spinner("Generazione turni in corso..."):
+                turni, stats, warnings = genera_turni_completo(flights_for_turns, selected_weekday)
+
+            if not turni:
+                st.error(f"Errore generazione turni: {stats.get('error', 'sconosciuto')}")
+            else:
+                copertura = stats.get("copertura_pct", 0)
+                if copertura >= 100:
+                    st.markdown(
+                        f"""
+                        <div class="success-box">
+                            ✅ <strong>COPERTURA 100%</strong> - Tutte le corse reali sono coperte
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f"""
+                        <div class="warning-box">
+                            ⚠️ <strong>Copertura {copertura:.1f}%</strong> - "
+                            "{stats.get('legs_coperti', 0)}/{stats.get('legs_reali', 0)} corse reali coperte
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                if warnings:
+                    with st.expander(f"⚠️ {len(warnings)} corse fuorilinea generate"):
+                        for w in warnings:
+                            st.write(w)
+
+                # Matrice validità (sostituisce tabella turni)
+                st.markdown("#### Matrice di validità dei turni per data")
+
+                dates_for_matrix = sorted(flights_for_turns["Date"].unique())
+                rows = []
+                for t in turni:
+                    row = {
+                        "Codice turno": t["code"],
+                        "Tipo turno": t["tipo_turno"],
+                        "Inizio": t["shift_start"].strftime("%H:%M"),
+                        "Fine": t["shift_end"].strftime("%H:%M"),
+                        "Lavoro": minutes_to_hhmm(t["lavoro_min"]),
+                    }
+                    for d in dates_for_matrix:
+                        col_name = d.strftime("%d-%m")
+                        row[col_name] = "✅" if d in t["date_valide"] else ""
+                    rows.append(row)
+
+                df_matrix = pd.DataFrame(rows)
+                st.dataframe(df_matrix, use_container_width=True)
+
+                csv_validita = df_matrix.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label="⬇️ Scarica matrice validità turni in CSV",
+                    data=csv_validita,
+                    file_name=f"matrice_validita_turni_{label_it.lower()}.csv",
+                    mime="text/csv",
+                )
+
+                # Dettaglio turno
+                st.markdown("#### Dettaglio corse per turno")
+                selected_code = st.selectbox(
+                    "Seleziona un turno per visualizzare il dettaglio delle corse",
+                    options=[t["code"] for t in turni],
+                )
+
+                if selected_code:
+                    t_sel = next(t for t in turni if t["code"] == selected_code)
+                    st.markdown(
+                        f"**Turno {selected_code} – elenco corse (una corsa = andata + ritorno):**"
+                    )
+                    st.text(t_sel["detail"])
+
+    # --------- GRAFICO ARRIVI/PARTENZE ---------
+    st.markdown("### Andamento giornaliero Arrivi / Partenze")
+
+    chart_df = flights_df.copy()
+
+    def map_dir(ad: str) -> Optional[str]:
+        if ad == "A":
+            return "Arrivi"
+        if ad in ("P", "D", "DEP", "DEPT", "DEPARTURE"):
+            return "Partenze"
+        return None
+
+    chart_df["Dir"] = chart_df["AD"].map(map_dir)
+    chart_df = chart_df.dropna(subset=["Dir"])
+
+    if not chart_df.empty:
+        daily_counts = (
+            chart_df.groupby(["Date", "Dir"])["Flight"]
+            .count()
+            .unstack("Dir")
+            .fillna(0)
+            .sort_index()
+        )
+        for col in ["Arrivi", "Partenze"]:
+            if col not in daily_counts.columns:
+                daily_counts[col] = 0
+        st.line_chart(daily_counts[["Arrivi", "Partenze"]])
+    else:
+        st.info("Nessun dato disponibile per costruire il grafico Arrivi/Partenze.")
 
 
 if __name__ == "__main__":
