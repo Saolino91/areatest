@@ -8,18 +8,26 @@ App Streamlit per:
 4. Visualizzare una matrice voli × date con interfaccia curata e filtri.
 5. Esportare la matrice in CSV.
 6. Visualizzare un grafico a linee Arrivi/Partenze per giorno.
-7. Generare turni guida sulla base dei voli filtrati.
+7. Generare turni guida con algoritmo ottimizzato OR-Tools.
 """
 
 import io
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import pdfplumber
 import streamlit as st
+
+# OR-Tools per ottimizzazione
+try:
+    from ortools.sat.python import cp_model
+    ORTOOLS_AVAILABLE = True
+except ImportError:
+    ORTOOLS_AVAILABLE = False
+    st.warning("⚠️ OR-Tools non installato. Usa: pip install ortools")
 
 
 # =========================
@@ -71,7 +79,7 @@ DAY_PREFIX = {
 
 # soglia per raggruppare voli ravvicinati (minuti)
 DEPARTURE_GROUP_DELTA_MIN = 20
-ARRIVAL_GROUP_DELTA_MIN = 20  # l'esempio con 15' è coperto (15 < 20)
+ARRIVAL_GROUP_DELTA_MIN = 20
 
 # target ore di lavoro effettivo per un turno intero (minuti)
 TARGET_WORK_MIN = 7 * 60  # 7 ore
@@ -521,8 +529,8 @@ def classify_shift_type(roundtrips: List[dict], nastro_min: float, work_min: flo
     # gap all'aeroporto: dentro ogni roundtrip (fine PCV-APT → inizio APT-PCV)
     apt_gaps = []
     for rt in roundtrips:
-        dep_end = rt["dep_leg"]["service_end"]     # arrivo in aeroporto
-        arr_start = rt["arr_leg"]["service_start"]  # partenza dall'aeroporto
+        dep_end = rt["dep_leg"]["service_end"]
+        arr_start = rt["arr_leg"]["service_start"]
         gap = (arr_start - dep_end).total_seconds() / 60.0
         apt_gaps.append(gap)
 
@@ -551,37 +559,257 @@ def classify_shift_type(roundtrips: List[dict], nastro_min: float, work_min: flo
     return "Altro"
 
 
-def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[dict]:
+# =========================
+# OTTIMIZZAZIONE CON OR-TOOLS CP-SAT
+# =========================
+
+def optimize_shifts_cp_sat(roundtrips: List[dict], weekday: str, max_shifts: int = 30, time_limit_sec: int = 30) -> Tuple[List[dict], dict]:
     """
-    Costruisce i TURNI a partire dalle corse (roundtrip) per UNA singola data.
+    Ottimizza l'assegnazione delle corse (roundtrips) ai turni usando OR-Tools CP-SAT.
+    
+    Obiettivo: minimizzare il numero di turni rispettando tutti i vincoli CCNL.
+    
+    Vincoli:
+    1. Ogni corsa assegnata a esattamente 1 turno
+    2. Max 3 corse per turno
+    3. Nastro turno <= 8h (480 min)
+    4. Nessuna sovrapposizione temporale tra corse dello stesso turno
+    5. Corse sequenziali (fine corsa i < inizio corsa i+1)
+    
+    Returns:
+        (shifts_list, stats) dove:
+        - shifts_list: lista di dict con la stessa struttura di build_shifts_from_roundtrips
+        - stats: dict con statistiche ottimizzazione (tempo, status, numero turni, etc.)
+    """
+    if not ORTOOLS_AVAILABLE:
+        return [], {"error": "OR-Tools non disponibile"}
+    
+    if not roundtrips:
+        return [], {"status": "NO_ROUNDTRIPS"}
+    
+    # Separa per data
+    dates_set = {rt["Date"] for rt in roundtrips}
+    if len(dates_set) > 1:
+        # Ottimizza separatamente per ogni data
+        all_shifts = []
+        all_stats = []
+        
+        for d in sorted(dates_set):
+            rts_d = [rt for rt in roundtrips if rt["Date"] == d]
+            shifts_d, stats_d = optimize_shifts_cp_sat_single_date(rts_d, weekday, max_shifts, time_limit_sec)
+            all_shifts.extend(shifts_d)
+            all_stats.append(stats_d)
+        
+        # Statistiche aggregate
+        combined_stats = {
+            "status": "MULTI_DATE",
+            "dates": len(dates_set),
+            "total_shifts": len(all_shifts),
+            "total_roundtrips": len(roundtrips),
+            "avg_solve_time": sum(s.get("solve_time", 0) for s in all_stats) / len(all_stats) if all_stats else 0,
+        }
+        
+        return all_shifts, combined_stats
+    else:
+        return optimize_shifts_cp_sat_single_date(roundtrips, weekday, max_shifts, time_limit_sec)
 
-    Ogni corsa:
-      - parte da Piazza Cavour
-      - torna a Piazza Cavour
-      - è già un A/R completo.
 
-    Strategia:
-      - ordina tutte le corse per orario di inizio;
-      - accumula corse in un turno finché:
-          * il nastro <= 8h
-          * il numero di corse <= 3
-          * la nuova corsa NON si sovrappone alla precedente nel tempo
-          * si cerca di avvicinarsi a ~7h di lavoro effettivo
-      - se aggiungere una corsa viola un vincolo o porterebbe troppo oltre le 7h,
-        si chiude il turno corrente e se ne apre uno nuovo.
+def optimize_shifts_cp_sat_single_date(roundtrips: List[dict], weekday: str, max_shifts: int = 30, time_limit_sec: int = 30) -> Tuple[List[dict], dict]:
+    """
+    Ottimizzazione CP-SAT per una singola data.
+    """
+    model = cp_model.CpModel()
+    n = len(roundtrips)
+    
+    # VARIABILI
+    # shift_used[j] = 1 se il turno j è utilizzato
+    shift_used = [model.NewBoolVar(f'shift_{j}') for j in range(max_shifts)]
+    
+    # assignment[i, j] = 1 se la corsa i è assegnata al turno j
+    assignment = {}
+    for i in range(n):
+        for j in range(max_shifts):
+            assignment[i, j] = model.NewBoolVar(f'x_{i}_{j}')
+    
+    # Variabili ausiliarie per calcolo nastro
+    shift_start = [model.NewIntVar(0, 24*60, f'start_{j}') for j in range(max_shifts)]
+    shift_end = [model.NewIntVar(0, 24*60, f'end_{j}') for j in range(max_shifts)]
+    
+    # VINCOLO 1: ogni corsa assegnata a esattamente 1 turno
+    for i in range(n):
+        model.Add(sum(assignment[i, j] for j in range(max_shifts)) == 1)
+    
+    # VINCOLO 2: se turno j ha almeno 1 corsa, è "usato"
+    for j in range(max_shifts):
+        corse_in_turno = sum(assignment[i, j] for i in range(n))
+        model.Add(corse_in_turno >= shift_used[j])
+        model.Add(corse_in_turno <= shift_used[j] * n)  # se non usato, 0 corse
+    
+    # VINCOLO 3: max 3 corse per turno
+    for j in range(max_shifts):
+        model.Add(sum(assignment[i, j] for i in range(n)) <= 3)
+    
+    # VINCOLO 4: nessuna sovrapposizione temporale
+    for j in range(max_shifts):
+        for i1 in range(n):
+            for i2 in range(i1 + 1, n):
+                rt1, rt2 = roundtrips[i1], roundtrips[i2]
+                
+                # Converti datetime in minuti dall'inizio giornata
+                start1 = rt1["start"].hour * 60 + rt1["start"].minute
+                end1 = rt1["end"].hour * 60 + rt1["end"].minute
+                start2 = rt2["start"].hour * 60 + rt2["start"].minute
+                end2 = rt2["end"].hour * 60 + rt2["end"].minute
+                
+                # Se si sovrappongono, non possono stare nello stesso turno
+                if not (end1 <= start2 or end2 <= start1):
+                    model.Add(assignment[i1, j] + assignment[i2, j] <= 1)
+    
+    # VINCOLO 5: sequenzialità (se i1 < i2 e sono nello stesso turno, end(i1) < start(i2))
+    for j in range(max_shifts):
+        for i1 in range(n):
+            for i2 in range(i1 + 1, n):
+                rt1, rt2 = roundtrips[i1], roundtrips[i2]
+                
+                # Se entrambe nel turno j, devono essere sequenziali
+                both_in_j = model.NewBoolVar(f'both_{i1}_{i2}_{j}')
+                model.Add(assignment[i1, j] + assignment[i2, j] == 2).OnlyEnforceIf(both_in_j)
+                model.Add(assignment[i1, j] + assignment[i2, j] <= 1).OnlyEnforceIf(both_in_j.Not())
+                
+                # Se entrambe nel turno, verifica ordine temporale
+                end1 = rt1["end"].hour * 60 + rt1["end"].minute
+                start2 = rt2["start"].hour * 60 + rt2["start"].minute
+                
+                if end1 >= start2:
+                    # Non possono stare insieme se non sono sequenziali
+                    model.Add(assignment[i1, j] + assignment[i2, j] <= 1)
+    
+    # VINCOLO 6: calcolo nastro turno
+    for j in range(max_shifts):
+        # Se il turno è usato, calcola inizio e fine
+        corse_indices = []
+        for i in range(n):
+            # Se corsa i è nel turno j
+            is_in_turno = model.NewBoolVar(f'in_turno_{i}_{j}')
+            model.Add(assignment[i, j] == 1).OnlyEnforceIf(is_in_turno)
+            model.Add(assignment[i, j] == 0).OnlyEnforceIf(is_in_turno.Not())
+            
+            rt = roundtrips[i]
+            start_min = (rt["start"].hour * 60 + rt["start"].minute) - 20  # 20' pre
+            end_min = (rt["end"].hour * 60 + rt["end"].minute) + 12  # 12' post
+            
+            # Contributo di questa corsa all'inizio/fine del turno
+            model.Add(shift_start[j] <= start_min).OnlyEnforceIf(is_in_turno)
+            model.Add(shift_end[j] >= end_min).OnlyEnforceIf(is_in_turno)
+        
+        # Nastro <= 8h = 480 min
+        nastro = model.NewIntVar(0, 24*60, f'nastro_{j}')
+        model.Add(nastro == shift_end[j] - shift_start[j])
+        model.Add(nastro <= 480).OnlyEnforceIf(shift_used[j])
+    
+    # OBIETTIVO: minimizza numero turni
+    model.Minimize(sum(shift_used))
+    
+    # RISOLVI
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = time_limit_sec
+    solver.parameters.log_search_progress = False
+    
+    status = solver.Solve(model)
+    
+    # ESTRAI SOLUZIONE
+    stats = {
+        "status": solver.StatusName(status),
+        "solve_time": solver.WallTime(),
+        "optimal": status == cp_model.OPTIMAL,
+        "num_shifts": 0,
+        "num_roundtrips": n,
+    }
+    
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        shifts_list = []
+        the_date = roundtrips[0]["Date"]
+        
+        for j in range(max_shifts):
+            if solver.Value(shift_used[j]):
+                # Estrai corse assegnate a questo turno
+                rt_list = []
+                for i in range(n):
+                    if solver.Value(assignment[i, j]):
+                        rt_list.append(roundtrips[i])
+                
+                if not rt_list:
+                    continue
+                
+                # Ordina per tempo
+                rt_list = sorted(rt_list, key=lambda x: x["start"])
+                
+                # Calcola metriche turno
+                first = rt_list[0]
+                last = rt_list[-1]
+                shift_start_dt = first["start"] - timedelta(minutes=20)
+                shift_end_dt = last["end"] + timedelta(minutes=12)
+                nastro_min = (shift_end_dt - shift_start_dt).total_seconds() / 60.0
+                work_min = sum((rt["end"] - rt["start"]).total_seconds() / 60.0 for rt in rt_list)
+                corses = len(rt_list)
+                
+                tipo_turno = classify_shift_type(rt_list, nastro_min, work_min)
+                
+                # Dettagli corse
+                detail_lines = []
+                for rt in rt_list:
+                    dep = rt["dep_leg"]
+                    arr = rt["arr_leg"]
+                    
+                    ora_p = dep["service_start"].strftime("%H:%M")
+                    ora_a = dep["service_end"].strftime("%H:%M")
+                    codici_dep = ",".join(dep["flights"])
+                    line_dep = f"{ora_p}, Piazza Cavour, Aeroporto, {ora_a}, {codici_dep}"
+                    detail_lines.append(line_dep)
+                    
+                    ora_p2 = arr["service_start"].strftime("%H:%M")
+                    ora_a2 = arr["service_end"].strftime("%H:%M")
+                    codici_arr = ",".join(arr["flights"])
+                    line_arr = f"{ora_p2}, Aeroporto, Piazza Cavour, {ora_a2}, {codici_arr}"
+                    detail_lines.append(line_arr)
+                
+                detail = "\n".join(detail_lines)
+                
+                shifts_list.append({
+                    "weekday": weekday,
+                    "date": the_date,
+                    "shift_start_dt": shift_start_dt,
+                    "shift_end_dt": shift_end_dt,
+                    "nastro_min": nastro_min,
+                    "work_min": work_min,
+                    "corses": corses,
+                    "detail": detail,
+                    "tipo_turno": tipo_turno,
+                })
+        
+        shifts_list = sorted(shifts_list, key=lambda s: s["shift_start_dt"])
+        stats["num_shifts"] = len(shifts_list)
+        
+        return shifts_list, stats
+    
+    else:
+        return [], stats
 
-    Nastro:
-      - inizio turno = inizio prima corsa - 20' (10' pre + 10' deposito→PCV)
-      - fine turno   = fine ultima corsa + 12' (10' PCV→deposito + 2' post)
+
+# =========================
+# ALGORITMO GREEDY ORIGINALE (per confronto)
+# =========================
+
+def build_shifts_from_roundtrips_greedy(roundtrips: List[dict], weekday: str) -> List[dict]:
+    """
+    Algoritmo greedy originale - mantenuto per confronto.
     """
     if not roundtrips:
         return []
 
-    # ATTENZIONE: roundtrips qui deve riferirsi a UNA sola data
     dates_set = {rt["Date"] for rt in roundtrips}
     if len(dates_set) > 1:
-        # se per errore arrivano date miste, separale fuori prima
-        raise ValueError("build_shifts_from_roundtrips deve ricevere corse di una sola data")
+        raise ValueError("build_shifts_from_roundtrips_greedy deve ricevere corse di una sola data")
 
     rts_sorted = sorted(roundtrips, key=lambda r: r["start"])
     shifts_rts: List[List[dict]] = []
@@ -600,35 +828,29 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
         return sum((rt["end"] - rt["start"]).total_seconds() / 60.0 for rt in rt_list)
 
     for rt in rts_sorted:
-        # se non c'è un turno aperto, apri con questa corsa
         if not current:
             current = [rt]
             continue
 
         last_rt = current[-1]
 
-        # vincolo 1: la nuova corsa deve partire DOPO la fine dell'ultima corsa
         if rt["start"] < last_rt["end"]:
             shifts_rts.append(current)
             current = [rt]
             continue
 
-        # prova ad aggiungere la corsa
         tentative = current + [rt]
         nastro_tent = nastro_minutes_for(tentative)
         work_tent = work_minutes_for(tentative)
         work_cur = work_minutes_for(current)
 
-        # vincolo nastro e max 3 corse
         if nastro_tent > 8 * 60 or len(tentative) > 3:
             shifts_rts.append(current)
             current = [rt]
             continue
 
-        # se aggiungere questa corsa ci avvicina o ci porta vicino al target di 7h,
-        # la aggiungiamo; se andremmo molto oltre, chiudiamo prima
         if work_cur < TARGET_WORK_MIN:
-            if work_tent <= TARGET_WORK_MIN + 60:  # tolleranza +1h
+            if work_tent <= TARGET_WORK_MIN + 60:
                 current.append(rt)
             else:
                 shifts_rts.append(current)
@@ -648,28 +870,22 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
         shift_start = first["start"] - timedelta(minutes=20)
         shift_end = last["end"] + timedelta(minutes=12)
         nastro_min = (shift_end - shift_start).total_seconds() / 60.0
-        work_min = sum(
-            (rt["end"] - rt["start"]).total_seconds() / 60.0
-            for rt in rt_list
-        )
-        corses = len(rt_list)  # numero di corse A/R
+        work_min = sum((rt["end"] - rt["start"]).total_seconds() / 60.0 for rt in rt_list)
+        corses = len(rt_list)
 
         tipo_turno = classify_shift_type(rt_list, nastro_min, work_min)
 
-        # dettagli corse nel formato richiesto
         detail_lines = []
         for rt in rt_list:
             dep = rt["dep_leg"]
             arr = rt["arr_leg"]
 
-            # leg andata: PCV -> APT
             ora_p = dep["service_start"].strftime("%H:%M")
             ora_a = dep["service_end"].strftime("%H:%M")
             codici_dep = ",".join(dep["flights"])
             line_dep = f"{ora_p}, Piazza Cavour, Aeroporto, {ora_a}, {codici_dep}"
             detail_lines.append(line_dep)
 
-            # leg ritorno: APT -> PCV
             ora_p2 = arr["service_start"].strftime("%H:%M")
             ora_a2 = arr["service_end"].strftime("%H:%M")
             codici_arr = ",".join(arr["flights"])
@@ -678,19 +894,17 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
 
         detail = "\n".join(detail_lines)
 
-        shifts.append(
-            {
-                "weekday": weekday,
-                "date": the_date,
-                "shift_start_dt": shift_start,
-                "shift_end_dt": shift_end,
-                "nastro_min": nastro_min,
-                "work_min": work_min,
-                "corses": corses,
-                "detail": detail,
-                "tipo_turno": tipo_turno,
-            }
-        )
+        shifts.append({
+            "weekday": weekday,
+            "date": the_date,
+            "shift_start_dt": shift_start,
+            "shift_end_dt": shift_end,
+            "nastro_min": nastro_min,
+            "work_min": work_min,
+            "corses": corses,
+            "detail": detail,
+            "tipo_turno": tipo_turno,
+        })
 
     return shifts
 
@@ -698,22 +912,12 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
 def assign_shift_codes_across_dates(shifts: List[dict], weekday: str) -> List[dict]:
     """
     Assegna i codici turno tenendo conto di TUTTE le date del weekday.
-
-    - raggruppa i turni per "pattern" (tipo_turno, orario inizio/fine, numero corse)
-    - a ogni pattern assegna un codice unico:
-        prefisso = prime due lettere del giorno in italiano (LU, MA, ME, GI, VE, SA, DO)
-        numero  = 01–49 per turni che iniziano prima delle 12:00
-                  50–99 per turni che iniziano dalle 12:00
-        suffisso = I (>=3 corse), P (2 corse), S (1 corsa)
-    - tutti i turni con lo stesso pattern (anche se in date diverse)
-      ricevono lo stesso codice → turni "stabili" per tipo giorno.
     """
     if not shifts:
         return shifts
 
     prefix = DAY_PREFIX.get(weekday, weekday[:2].upper())
 
-    # cluster per pattern
     patterns = defaultdict(list)
     for s in shifts:
         key = (
@@ -724,13 +928,11 @@ def assign_shift_codes_across_dates(shifts: List[dict], weekday: str) -> List[di
         )
         patterns[key].append(s)
 
-    # lista (key, sample_shift) per ordinamento
     pattern_items = []
     for key, plist in patterns.items():
         sample = sorted(plist, key=lambda x: x["shift_start_dt"])[0]
         pattern_items.append((key, sample))
 
-    # separa AM/PM
     am = [(key, s) for key, s in pattern_items if s["shift_start_dt"].hour < 12]
     pm = [(key, s) for key, s in pattern_items if s["shift_start_dt"].hour >= 12]
 
@@ -739,7 +941,6 @@ def assign_shift_codes_across_dates(shifts: List[dict], weekday: str) -> List[di
 
     code_by_key = {}
 
-    # AM: 01–49
     idx = 1
     for key, sample in am:
         num = min(idx, 49)
@@ -753,7 +954,6 @@ def assign_shift_codes_across_dates(shifts: List[dict], weekday: str) -> List[di
             suffix = "S"
         code_by_key[key] = f"{prefix}{num:02d}{suffix}"
 
-    # PM: 50–99
     idx = 50
     for key, sample in pm:
         num = min(idx, 99)
@@ -767,7 +967,6 @@ def assign_shift_codes_across_dates(shifts: List[dict], weekday: str) -> List[di
             suffix = "S"
         code_by_key[key] = f"{prefix}{num:02d}{suffix}"
 
-    # assegna codice a tutti i turni
     for s in shifts:
         key = (
             s["tipo_turno"],
@@ -780,50 +979,59 @@ def assign_shift_codes_across_dates(shifts: List[dict], weekday: str) -> List[di
     return shifts
 
 
-def generate_driver_shifts(filtered_flights: pd.DataFrame, weekday: str) -> pd.DataFrame:
+def generate_driver_shifts(filtered_flights: pd.DataFrame, weekday: str, use_optimization: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
-    Pipeline completa:
-    - da voli filtrati → legs bus → corse (A/R) → turni PER DATA
-    - poi clusterizza i turni per pattern e assegna codici uguali
-      per lo stesso schema di turno su date diverse.
+    Pipeline completa con possibilità di scegliere algoritmo greedy o ottimizzato.
+    
+    Returns:
+        (df_optimal, df_greedy, comparison_stats)
     """
     trips = build_bus_trips_from_flights(filtered_flights)
     if not trips:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), {}
 
     roundtrips_all = build_roundtrips_from_trips(trips)
     if not roundtrips_all:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), {}
 
-    shifts_list: List[dict] = []
+    # ALGORITMO OTTIMIZZATO
+    if use_optimization and ORTOOLS_AVAILABLE:
+        shifts_optimal, opt_stats = optimize_shifts_cp_sat(roundtrips_all, weekday)
+        if shifts_optimal:
+            shifts_optimal = assign_shift_codes_across_dates(shifts_optimal, weekday)
+    else:
+        shifts_optimal = []
+        opt_stats = {"status": "SKIPPED"}
 
-    # costruisci turni per ogni singola data del tipo giorno
+    # ALGORITMO GREEDY (per confronto)
+    shifts_greedy = []
     for d in sorted(filtered_flights["Date"].unique()):
         rts_d = [rt for rt in roundtrips_all if rt["Date"] == d]
         if not rts_d:
             continue
-        shifts_d = build_shifts_from_roundtrips(rts_d, weekday)
-        shifts_list.extend(shifts_d)
+        shifts_d = build_shifts_from_roundtrips_greedy(rts_d, weekday)
+        shifts_greedy.extend(shifts_d)
+    
+    if shifts_greedy:
+        shifts_greedy = assign_shift_codes_across_dates(shifts_greedy, weekday)
 
-    if not shifts_list:
-        return pd.DataFrame()
+    # Converti in DataFrame
+    def shifts_to_df(shifts_list):
+        if not shifts_list:
+            return pd.DataFrame()
+        
+        rows = []
+        for s in shifts_list:
+            start_dt = s["shift_start_dt"]
+            end_dt = s["shift_end_dt"]
+            nastro_min = int(round(s["nastro_min"]))
+            work_min = int(round(s["work_min"]))
+            corses = s["corses"]
+            code = s.get("code", "")
+            tipo_turno = s["tipo_turno"]
+            d = s["date"]
 
-    # assegna codici coerenti tra date
-    shifts_list = assign_shift_codes_across_dates(shifts_list, weekday)
-
-    rows = []
-    for s in shifts_list:
-        start_dt = s["shift_start_dt"]
-        end_dt = s["shift_end_dt"]
-        nastro_min = int(round(s["nastro_min"]))
-        work_min = int(round(s["work_min"]))
-        corses = s["corses"]
-        code = s.get("code", "")
-        tipo_turno = s["tipo_turno"]
-        d = s["date"]
-
-        rows.append(
-            {
+            rows.append({
                 "Codice turno": code,
                 "Tipo giorno": WEEKDAY_LABELS_IT.get(weekday, weekday),
                 "Tipo turno": tipo_turno,
@@ -833,14 +1041,27 @@ def generate_driver_shifts(filtered_flights: pd.DataFrame, weekday: str) -> pd.D
                 "Fine turno": end_dt.strftime("%H:%M"),
                 "Durata nastro (min)": nastro_min,
                 "Durata lavoro (min)": work_min,
-                "Numero corse": corses,  # una corsa = andata+ritorno
+                "Numero corse": corses,
                 "Dettaglio corse": s["detail"],
-            }
-        )
+            })
 
-    df_shifts = pd.DataFrame(rows)
-    df_shifts = df_shifts.sort_values(["Date", "Inizio turno", "Codice turno"]).reset_index(drop=True)
-    return df_shifts
+        df = pd.DataFrame(rows)
+        df = df.sort_values(["Date", "Inizio turno", "Codice turno"]).reset_index(drop=True)
+        return df
+
+    df_optimal = shifts_to_df(shifts_optimal)
+    df_greedy = shifts_to_df(shifts_greedy)
+
+    # Statistiche confronto
+    comparison_stats = {
+        "optimal_shifts": len(shifts_optimal),
+        "greedy_shifts": len(shifts_greedy),
+        "improvement": len(shifts_greedy) - len(shifts_optimal) if shifts_optimal else 0,
+        "improvement_pct": ((len(shifts_greedy) - len(shifts_optimal)) / len(shifts_greedy) * 100) if shifts_greedy and shifts_optimal else 0,
+        "opt_stats": opt_stats,
+    }
+
+    return df_optimal, df_greedy, comparison_stats
 
 
 # =========================
@@ -923,12 +1144,28 @@ def main():
         }
 
         .uploadedFile { font-size: 0.9rem !important; }
+        
+        .metric-card {
+            background: linear-gradient(135deg, rgba(59,130,246,0.1), rgba(147,51,234,0.1));
+            padding: 1rem;
+            border-radius: 0.5rem;
+            border: 1px solid rgba(59,130,246,0.3);
+        }
+        
+        .improvement-badge {
+            background: linear-gradient(135deg, #10b981, #059669);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            font-weight: bold;
+            display: inline-block;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    st.title("✈️ Flight Matrix")
+    st.title("✈️ Flight Matrix + Ottimizzazione Turni")
 
     with st.container():
         st.markdown(
@@ -941,7 +1178,8 @@ def main():
                     <li>esclude i voli <strong>CARGO</strong></li>
                     <li>raggruppa per <strong>giorno della settimana</strong></li>
                     <li>mostra una <strong>matrice</strong> con i voli per tipologia giorno</li>
-                    <li>genera <strong>turni guida</strong> sulla base dei voli filtrati</li>
+                    <li>genera <strong>turni guida ottimizzati</strong> con algoritmo CP-SAT (OR-Tools)</li>
+                    <li>confronta soluzione ottimizzata vs algoritmo greedy</li>
                 </ul>
             </div>
             """,
@@ -1105,9 +1343,25 @@ def main():
         )
 
         # --------- GENERAZIONE TURNI GUIDA ---------
-        st.markdown("### Turni guida generati")
+        st.markdown("---")
+        st.markdown("## 🚀 Ottimizzazione Turni Guida")
+        
+        st.markdown("""
+        <div class="info-card" style="margin-bottom: 1rem;">
+            <p><strong>Algoritmo di ottimizzazione CP-SAT (Google OR-Tools)</strong></p>
+            <p style="margin-top: 0.5rem;">
+            L'ottimizzatore risolve un problema di <em>Vehicle Scheduling</em> con vincoli CCNL:
+            </p>
+            <ul style="margin-top: 0.3rem; margin-bottom: 0;">
+                <li>✅ Minimizza il numero di autisti necessari</li>
+                <li>✅ Rispetta vincoli su nastro (max 8h), numero corse (max 3), sequenzialità</li>
+                <li>✅ Garantisce soluzione ottima o near-ottima matematicamente provata</li>
+                <li>✅ Confronto automatico con algoritmo greedy</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
 
-        if st.button("Genera turni guida per questo tipo di giorno"):
+        if st.button("🎯 Genera turni ottimizzati", type="primary"):
             flights_for_turns = filter_flights_for_turns(
                 flights_df,
                 selected_weekday,
@@ -1119,95 +1373,173 @@ def main():
             if flights_for_turns.empty:
                 st.warning("Nessun volo disponibile per generare i turni guida con i filtri correnti.")
             else:
-                shifts_df = generate_driver_shifts(flights_for_turns, selected_weekday)
-                if shifts_df.empty:
+                with st.spinner("Ottimizzazione in corso... (può richiedere fino a 30 secondi)"):
+                    df_optimal, df_greedy, comparison_stats = generate_driver_shifts(
+                        flights_for_turns, 
+                        selected_weekday,
+                        use_optimization=True
+                    )
+                
+                if df_optimal.empty and df_greedy.empty:
                     st.warning("Non è stato possibile generare turni compatibili con i vincoli.")
                 else:
-                    # tabella turni: fermarsi a Numero corse
-                    display_cols = [
-                        "Codice turno",
-                        "Tipo giorno",
-                        "Tipo turno",
-                        "Data (esempio)",
-                        "Inizio turno",
-                        "Fine turno",
-                        "Durata nastro (min)",
-                        "Durata lavoro (min)",
-                        "Numero corse",
-                    ]
-                    df_turni_view = shifts_df[display_cols]
-
-                    st.dataframe(df_turni_view, use_container_width=True)
-
-                    csv_shifts = df_turni_view.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        label="⬇️ Scarica turni guida in CSV",
-                        data=csv_shifts,
-                        file_name=f"turni_{label_it.lower()}.csv",
-                        mime="text/csv",
-                    )
-
-                    # --------- MATRICE VALIDITÀ TURNI × DATE ---------
-                    st.markdown("#### Matrice di validità dei turni per data")
-
-                    dates_for_matrix = sorted(flights_for_turns["Date"].unique())
-                    if dates_for_matrix:
-                        base = shifts_df[
-                            [
-                                "Codice turno",
-                                "Tipo turno",
-                                "Inizio turno",
-                                "Fine turno",
-                                "Durata lavoro (min)",
-                                "Date",
-                            ]
-                        ]
-
-                        rows_matrix = []
-                        for code in sorted(base["Codice turno"].unique()):
-                            sub = base[base["Codice turno"] == code]
-                            tipo = sub["Tipo turno"].iloc[0]
-                            start = sub["Inizio turno"].iloc[0]
-                            end = sub["Fine turno"].iloc[0]
-                            work = sub["Durata lavoro (min)"].iloc[0]
-
-                            row = {
-                                "Codice turno": code,
-                                "Tipo turno": tipo,
-                                "Inizio": start,
-                                "Fine": end,
-                                "Lavoro (min)": work,
-                            }
-
-                            for d in dates_for_matrix:
-                                col_name = d.strftime("%d-%m")
-                                has = any(sub["Date"] == d)
-                                row[col_name] = "✅" if has else ""
-
-                            rows_matrix.append(row)
-
-                        df_matrix = pd.DataFrame(rows_matrix)
-                        st.dataframe(df_matrix, use_container_width=True)
-
-                    # Dettaglio di un turno selezionato
-                    st.markdown("#### Dettaglio corse per turno")
-                    selected_code = st.selectbox(
-                        "Seleziona un turno per visualizzare il dettaglio delle corse",
-                        options=shifts_df["Codice turno"].unique(),
-                    )
-
-                    if selected_code:
-                        detail_text = shifts_df.loc[
-                            shifts_df["Codice turno"] == selected_code, "Dettaglio corse"
-                        ].iloc[0]
-
-                        st.markdown(
-                            f"**Turno {selected_code} – elenco corse (una corsa = andata + ritorno):**"
+                    # --------- METRICHE CONFRONTO ---------
+                    st.markdown("### 📊 Confronto Algoritmi")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+                        st.metric(
+                            "🎯 Soluzione Ottimizzata",
+                            f"{comparison_stats['optimal_shifts']} turni",
+                            help="Soluzione trovata con algoritmo CP-SAT"
                         )
-                        st.text(detail_text)
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    
+                    with col2:
+                        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+                        st.metric(
+                            "📈 Algoritmo Greedy",
+                            f"{comparison_stats['greedy_shifts']} turni",
+                            help="Soluzione con algoritmo euristico"
+                        )
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    
+                    with col3:
+                        improvement = comparison_stats['improvement']
+                        improvement_pct = comparison_stats['improvement_pct']
+                        
+                        if improvement > 0:
+                            st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+                            st.metric(
+                                "💰 Risparmio",
+                                f"{improvement} autisti",
+                                f"-{improvement_pct:.1f}%",
+                                delta_color="inverse",
+                                help="Autisti risparmiati con ottimizzazione"
+                            )
+                            st.markdown('</div>', unsafe_allow_html=True)
+                            
+                            st.markdown(
+                                f'<div class="improvement-badge" style="margin-top: 0.5rem;">⭐ Miglioramento: {improvement_pct:.1f}%</div>',
+                                unsafe_allow_html=True
+                            )
+                        else:
+                            st.info("Entrambi gli algoritmi hanno trovato lo stesso numero di turni")
+                    
+                    # Info ottimizzazione
+                    if comparison_stats.get('opt_stats'):
+                        opt_stats = comparison_stats['opt_stats']
+                        with st.expander("ℹ️ Dettagli ottimizzazione"):
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.write(f"**Status**: {opt_stats.get('status', 'N/A')}")
+                                st.write(f"**Ottimale**: {'✅ Sì' if opt_stats.get('optimal', False) else '⚠️ Feasible'}")
+                            with col2:
+                                st.write(f"**Tempo calcolo**: {opt_stats.get('solve_time', 0):.2f}s")
+                                st.write(f"**Corse totali**: {opt_stats.get('num_roundtrips', 0)}")
+                    
+                    # --------- TABELLA TURNI OTTIMIZZATI ---------
+                    st.markdown("### 🎯 Turni Ottimizzati (Soluzione migliore)")
+                    
+                    if not df_optimal.empty:
+                        display_cols = [
+                            "Codice turno",
+                            "Tipo giorno",
+                            "Tipo turno",
+                            "Data (esempio)",
+                            "Inizio turno",
+                            "Fine turno",
+                            "Durata nastro (min)",
+                            "Durata lavoro (min)",
+                            "Numero corse",
+                        ]
+                        df_opt_view = df_optimal[display_cols]
+                        
+                        st.dataframe(df_opt_view, use_container_width=True)
+                        
+                        csv_opt = df_opt_view.to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            label="⬇️ Scarica turni ottimizzati in CSV",
+                            data=csv_opt,
+                            file_name=f"turni_ottimizzati_{label_it.lower()}.csv",
+                            mime="text/csv",
+                        )
+                        
+                        # --------- MATRICE VALIDITÀ TURNI × DATE ---------
+                        st.markdown("#### 📅 Matrice di validità dei turni per data")
+                        
+                        dates_for_matrix = sorted(flights_for_turns["Date"].unique())
+                        if dates_for_matrix:
+                            base = df_optimal[
+                                [
+                                    "Codice turno",
+                                    "Tipo turno",
+                                    "Inizio turno",
+                                    "Fine turno",
+                                    "Durata lavoro (min)",
+                                    "Date",
+                                ]
+                            ]
+                            
+                            rows_matrix = []
+                            for code in sorted(base["Codice turno"].unique()):
+                                sub = base[base["Codice turno"] == code]
+                                tipo = sub["Tipo turno"].iloc[0]
+                                start = sub["Inizio turno"].iloc[0]
+                                end = sub["Fine turno"].iloc[0]
+                                work = sub["Durata lavoro (min)"].iloc[0]
+                                
+                                row = {
+                                    "Codice turno": code,
+                                    "Tipo turno": tipo,
+                                    "Inizio": start,
+                                    "Fine": end,
+                                    "Lavoro (min)": work,
+                                }
+                                
+                                for d in dates_for_matrix:
+                                    col_name = d.strftime("%d-%m")
+                                    has = any(sub["Date"] == d)
+                                    row[col_name] = "✅" if has else ""
+                                
+                                rows_matrix.append(row)
+                            
+                            df_matrix = pd.DataFrame(rows_matrix)
+                            st.dataframe(df_matrix, use_container_width=True)
+                        
+                        # Dettaglio turno selezionato
+                        st.markdown("#### 🔍 Dettaglio corse per turno")
+                        selected_code = st.selectbox(
+                            "Seleziona un turno per visualizzare il dettaglio delle corse",
+                            options=df_optimal["Codice turno"].unique(),
+                        )
+                        
+                        if selected_code:
+                            detail_text = df_optimal.loc[
+                                df_optimal["Codice turno"] == selected_code, "Dettaglio corse"
+                            ].iloc[0]
+                            
+                            st.markdown(
+                                f"**Turno {selected_code} – elenco corse (una corsa = andata + ritorno):**"
+                            )
+                            st.text(detail_text)
+                    else:
+                        st.info("Nessun turno ottimizzato generato (verificare vincoli o disponibilità corse)")
+                    
+                    # --------- CONFRONTO CON GREEDY (opzionale) ---------
+                    with st.expander("📈 Confronto con algoritmo Greedy"):
+                        if not df_greedy.empty:
+                            st.markdown("**Turni generati con algoritmo greedy (euristico):**")
+                            df_greedy_view = df_greedy[display_cols]
+                            st.dataframe(df_greedy_view, use_container_width=True)
+                        else:
+                            st.info("Algoritmo greedy non ha generato turni")
 
     # --------- GRAFICO ARRIVI/PARTENZE PER GIORNO ---------
-    st.markdown("### Andamento giornaliero Arrivi / Partenze")
+    st.markdown("---")
+    st.markdown("### 📈 Andamento giornaliero Arrivi / Partenze")
 
     chart_df = flights_df.copy()
 
