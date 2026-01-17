@@ -71,6 +71,9 @@ DAY_PREFIX = {
 DEPARTURE_GROUP_DELTA_MIN = 20
 ARRIVAL_GROUP_DELTA_MIN = 20  # l'esempio con 15' è coperto (15 < 20)
 
+# target ore di lavoro effettivo per un turno intero (minuti)
+TARGET_WORK_MIN = 7 * 60  # 7 ore
+
 
 # =========================
 # PARSING PDF
@@ -198,6 +201,7 @@ def parse_pdf_to_flights_df(file_obj: io.BytesIO) -> pd.DataFrame:
     df["ETA"] = df["ETA"].str.strip()
     df["ETD"] = df["ETD"].str.strip()
 
+    # solo PAX
     df = df[df["Type"] == "PAX"].copy()
     df.replace({"": None}, inplace=True)
 
@@ -445,7 +449,6 @@ def build_roundtrips_from_trips(trips: List[dict]) -> List[dict]:
     if not trips:
         return roundtrips
 
-    # raggruppo per data
     for d in sorted({t["Date"] for t in trips}):
         day_trips = [t for t in trips if t["Date"] == d]
         dep_legs = [t for t in day_trips if t["Direction"] == "PCV-APT"]
@@ -457,7 +460,6 @@ def build_roundtrips_from_trips(trips: List[dict]) -> List[dict]:
         used_arr = [False] * len(arr_legs)
 
         for dep in dep_legs:
-            # cerco il primo arrivo compatibile dopo la fine del dep
             chosen_idx = None
             for idx, arr in enumerate(arr_legs):
                 if used_arr[idx]:
@@ -467,7 +469,6 @@ def build_roundtrips_from_trips(trips: List[dict]) -> List[dict]:
                     break
 
             if chosen_idx is None:
-                # dep non matchato, non genera corsa completa
                 continue
 
             arr = arr_legs[chosen_idx]
@@ -487,6 +488,68 @@ def build_roundtrips_from_trips(trips: List[dict]) -> List[dict]:
     return roundtrips
 
 
+def classify_shift_type(roundtrips: List[dict], nastro_min: float, work_min: float) -> str:
+    """
+    Classifica il turno in:
+    - Supplemento
+    - Part-time
+    - Intero
+    - Semiunico
+    - Spezzato
+    - Inoperoso
+    in modo approssimato ma coerente con le regole che hai descritto.
+    """
+
+    # Supplemento: turno breve max 3h
+    if nastro_min <= 180:
+        return "Supplemento"
+
+    # Part-time: lavoro effettivo tra 3 e 6 ore
+    if 180 < work_min < 360 and nastro_min <= 8 * 60:
+        return "Part-time"
+
+    # calcolo gap a PCV tra le corse (end_i → start_{i+1})
+    pcv_gaps = []
+    for i in range(len(roundtrips) - 1):
+        end_i = roundtrips[i]["end"]
+        start_j = roundtrips[i + 1]["start"]
+        gap = (start_j - end_i).total_seconds() / 60.0
+        pcv_gaps.append(gap)
+
+    # gap all'aeroporto: dentro ogni roundtrip (fine PCV-APT → inizio APT-PCV)
+    apt_gaps = []
+    for rt in roundtrips:
+        dep_end = rt["dep_leg"]["service_end"]   # arrivo in aeroporto
+        arr_start = rt["arr_leg"]["service_start"]  # partenza dall'aeroporto
+        gap = (arr_start - dep_end).total_seconds() / 60.0
+        apt_gaps.append(gap)
+
+    max_pcv_gap = max(pcv_gaps) if pcv_gaps else 0
+    max_apt_gap = max(apt_gaps) if apt_gaps else 0
+
+    # Inoperoso: nastro max 9h, sosta inoperosa in aeroporto >= 31'
+    if nastro_min <= 9 * 60 and max_apt_gap >= 31:
+        return "Inoperoso"
+
+    # Spezzato: nastro max 10h30, interruzione in deposito (a PCV) >= 3h
+    if nastro_min <= 10 * 60 + 30 and max_pcv_gap >= 180:
+        return "Spezzato"
+
+    # Semiunico: nastro max 9h15, interruzione a PCV >=40' (ma <3h)
+    if nastro_min <= 9 * 60 + 15 and 40 <= max_pcv_gap < 180:
+        return "Semiunico"
+
+    # Intero: nastro <= 8h, nessuna interruzione > 40', almeno una pausa >=30'
+    if nastro_min <= 8 * 60:
+        if max_pcv_gap <= 40 and any(g >= 30 for g in pcv_gaps):
+            return "Intero"
+        # altrimenti comunque Intero "sporco"
+        return "Intero"
+
+    # fallback
+    return "Altro"
+
+
 def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[dict]:
     """
     Costruisce i TURNI a partire dalle corse (roundtrip).
@@ -502,7 +565,9 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
           * il nastro <= 8h
           * il numero di corse <= 3
           * la nuova corsa NON si sovrappone alla precedente nel tempo
-      - se uno di questi vincoli salta, si chiude il turno corrente e se ne apre uno nuovo.
+          * si cerca di avvicinarsi a ~7h di lavoro effettivo
+      - se aggiungere una corsa viola un vincolo o porterebbe troppo oltre le 7h,
+        si chiude il turno corrente e se ne apre uno nuovo.
 
     Nastro:
       - inizio turno = inizio prima corsa - 20' (10' pre + 10' deposito→PCV)
@@ -510,12 +575,12 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
 
     Questo garantisce che:
       - ogni turno inizia e finisce a Piazza Cavour,
-      - le corse nello stesso turno siano temporalmente compatibili (nessun accavallamento).
+      - le corse nello stesso turno siano temporalmente compatibili (nessun accavallamento),
+      - si tende a riempire i turni fino a ~7 ore di lavoro effettivo.
     """
     if not roundtrips:
         return []
 
-    # corse ordinate per inizio
     rts_sorted = sorted(roundtrips, key=lambda r: r["start"])
     shifts_rts: List[List[dict]] = []
     current: List[dict] = []
@@ -529,6 +594,9 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
         shift_end = last["end"] + timedelta(minutes=12)
         return (shift_end - shift_start).total_seconds() / 60.0
 
+    def work_minutes_for(rt_list: List[dict]) -> float:
+        return sum((rt["end"] - rt["start"]).total_seconds() / 60.0 for rt in rt_list)
+
     for rt in rts_sorted:
         # se non c'è un turno aperto, apri con questa corsa
         if not current:
@@ -537,31 +605,43 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
 
         last_rt = current[-1]
 
-        # vincolo 1: la nuova corsa deve partire DOPO la fine dell'ultima corsa del turno
-        # (altrimenti lo stesso bus dovrebbe essere in due posti contemporaneamente)
+        # vincolo 1: la nuova corsa deve partire DOPO la fine dell'ultima corsa
         if rt["start"] < last_rt["end"]:
-            # non compatibile con il turno corrente → chiudi il turno e aprine uno nuovo
             shifts_rts.append(current)
             current = [rt]
             continue
 
-        # vincolo 2: prova ad aggiungere la corsa e verifica nastro e numero corse
+        # prova ad aggiungere la corsa
         tentative = current + [rt]
-        nastro = nastro_minutes_for(tentative)
+        nastro_tent = nastro_minutes_for(tentative)
+        work_tent = work_minutes_for(tentative)
+        work_cur = work_minutes_for(current)
 
-        if len(tentative) <= 3 and nastro <= 8 * 60:
-            # ok, stessa macchina può fare anche questa corsa
-            current.append(rt)
+        # vincolo nastro e max 3 corse
+        if nastro_tent > 8 * 60 or len(tentative) > 3:
+            # turno corrente si chiude, anche se non ha raggiunto target
+            shifts_rts.append(current)
+            current = [rt]
+            continue
+
+        # se aggiungere questa corsa ci avvicina o ci porta vicino al target di 7h,
+        # la aggiungiamo; se andremmo molto oltre, chiudiamo prima
+        if work_cur < TARGET_WORK_MIN:
+            # se ci porta fino a 7h o poco oltre (es. <= 8h di lavoro), ok
+            if work_tent <= TARGET_WORK_MIN + 60:  # tolleranza +1h
+                current.append(rt)
+            else:
+                # sarebbe troppo pieno → chiudo il turno attuale e apro uno nuovo
+                shifts_rts.append(current)
+                current = [rt]
         else:
-            # il turno diventerebbe troppo lungo o con troppe corse → chiudi e riparti
+            # abbiamo già raggiunto almeno 7h, non aggiungiamo altro a questo turno
             shifts_rts.append(current)
             current = [rt]
 
-    # ultimo turno
     if current:
         shifts_rts.append(current)
 
-    # costruisci la struttura finale dei turni
     shifts: List[dict] = []
     for rt_list in shifts_rts:
         first = rt_list[0]
@@ -575,13 +655,7 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
         )
         corses = len(rt_list)  # numero di corse A/R
 
-        # classificazione semplice
-        if nastro_min <= 180:
-            tipo_turno = "Supplemento"
-        elif nastro_min < 360:
-            tipo_turno = "Part-time"
-        else:
-            tipo_turno = "Intero"
+        tipo_turno = classify_shift_type(rt_list, nastro_min, work_min)
 
         # dettagli corse nel formato richiesto
         detail_lines = []
@@ -615,6 +689,7 @@ def build_shifts_from_roundtrips(roundtrips: List[dict], weekday: str) -> List[d
                 "corses": corses,
                 "detail": detail,
                 "dates_covered": sorted({rt["Date"] for rt in rt_list}),
+                "tipo_turno": tipo_turno,
             }
         )
 
@@ -698,13 +773,7 @@ def generate_driver_shifts(filtered_flights: pd.DataFrame, weekday: str) -> pd.D
         work_min = int(round(s["work_min"]))
         corses = s["corses"]
         code = s.get("code", "")
-
-        if nastro_min <= 180:
-            tipo_turno = "Supplemento"
-        elif nastro_min < 360:
-            tipo_turno = "Part-time"
-        else:
-            tipo_turno = "Intero"
+        tipo_turno = s["tipo_turno"]
 
         rows.append(
             {
@@ -1030,7 +1099,7 @@ def main():
                         mime="text/csv",
                     )
 
-                    # Dettaglio di un turno selezionato (simile a "cliccare" sulla riga)
+                    # Dettaglio di un turno selezionato
                     st.markdown("#### Dettaglio corse per turno")
                     selected_code = st.selectbox(
                         "Seleziona un turno per visualizzare il dettaglio delle corse",
